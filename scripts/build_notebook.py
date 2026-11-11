@@ -21,7 +21,7 @@ md("""
 | **Programme / Batch** | MAIB · September 2025 |
 | **Institution** | SP Jain School of Global Management |
 | **Instructor** | Dr. Sandip Kumar Roy |
-| **Interactive dashboard** | Streamlit app in `apps/streamlit/app.py` (same engine as this notebook) |
+| **Interactive dashboard** | Streamlit app in `apps/streamlit/app.py` (same engine as this notebook) |\n| **Code** | https://github.com/krish2105/Inventory-Management-AI-in-Operations |
 
 *Individual work. In line with the brief ("No sharing of data with peers allowed"), no data was shared with peers.*
 """)
@@ -34,6 +34,8 @@ md("""
 | 1 | Demand forecasting | ML models (time series, regression, LSTM) on history, seasonality, promotions, external factors; allow adding new data; continuously update forecasts | §3–4 |
 | 2 | Dynamic safety stock | Probabilistic models for demand variability **and** lead-time uncertainty; Monte Carlo simulation of risk scenarios and buffers; formula $SS = Z\\sqrt{\\sigma_D^2 L + \\bar D^2\\sigma_L^2}$ | §5–6 |
 | 3 | AI-driven sensitivity analysis | Bayesian optimisation instead of manual parameter sweeps to find optimal reorder points under constraints | §7 |
+| + | **Before AI vs After AI** | What the AI adds over the classic (pre-AI) reorder-point method, measured on real demand | §8 |
+| + | **AI automation** | Drift-triggered retraining, anomaly detection, ML segmentation, replenishment agent, exception digest | §9 |
 """)
 code("""
 import sys, subprocess, os, warnings
@@ -233,7 +235,66 @@ ax[1].set_xlabel('reorder point s'); ax[1].set_ylabel('order quantity Q'); ax[1]
 plt.colorbar(cs, ax=ax[1]); plt.tight_layout(); plt.savefig(FIG / 'fig_bayesopt.png', dpi=160); plt.show()
 """)
 md("""
-## 8. Portfolio application (all 40 SKUs)
+## 8. Before AI vs After AI — what does the AI actually add?
+The reorder-point formula is decades old; using it is **not** AI. To show the value of the AI layer, both approaches are replayed **day by day on the last 26 weeks of real demand** (Jun – Dec 2011, including the Christmas surge) for all 40 SKUs, with identical seeded supplier lead times and costs.
+
+| | Before AI (classic textbook) | After AI (this system) |
+|---|---|---|
+| Demand estimate | mean of all history, computed once | forecast **refit every week**; drift alarms (tracking signal) trigger champion/challenger re-selection between ETS and gradient boosting |
+| Bias | ignored | recent under-forecasting is detected and **added back** |
+| Uncertainty | σ of all history, Normal formula | **conformal** buffer: α-quantile of the system's own realised lead-time forecast errors (+ lead-time term) |
+| Service level | one α for all SKUs | **cost-optimal α** (lost-sales critical ratio 1 − hQ/(pD)) floored by the **ML segment** α |
+| Order quantity | EOQ on history | EOQ on the live forecast; Bayesian optimisation (§7) |
+""")
+code("""
+from inventory_core import automation as A
+rf = ROOT / 'data/processed/ai_rolling_forecasts.csv'
+if rf.exists():
+    roll = pd.read_csv(rf, dtype={'sku': str}, parse_dates=['week']); rlog = pd.read_csv(ROOT / 'data/processed/ai_retrain_log.csv')
+else:   # ~2-3 min: walk-forward retraining for all SKUs
+    roll, rlog = A.rolling_ai_all(df, 26)
+seg = A.segment(df)
+BA, PATHS = A.before_after(df, roll, 0.95, 14, 4, seg=seg)
+dem = roll.actual.sum()
+w = roll.groupby('sku').actual.sum().reindex(BA.sku).values
+summary = pd.DataFrame({
+  'metric': ['Fill rate', 'Lost sales (units)', 'Stockout days', 'Total cost 26 wks (£)', 'Avg inventory value (£)', 'Forecast WAPE %'],
+  'Before AI': [1 - BA.before_units_short.sum()/dem, BA.before_units_short.sum(), BA.before_stockout_days.sum(), BA.before_total_cost.sum(), BA.before_inv_value.sum(), (BA.wape_before*w).sum()/dem],
+  'After AI':  [1 - BA.after_units_short.sum()/dem, BA.after_units_short.sum(), BA.after_stockout_days.sum(), BA.after_total_cost.sum(), BA.after_inv_value.sum(), (BA.wape_after*w).sum()/dem]})
+summary['change %'] = 100 * (summary['After AI'] / summary['Before AI'] - 1)
+display(summary.round(3))
+print(f"Automatic retrains: {len(rlog)} ({rlog.event.str.startswith('drift').sum()} drift-triggered, {int(rlog.switched.sum())} model switches). AI cheaper on {(BA.after_total_cost < BA.before_total_cost).sum()}/40 SKUs.")
+""")
+code("""
+p = PATHS[SKU]
+fig, ax = plt.subplots(1, 2, figsize=(14, 4.2))
+ax[0].bar(p['dates'], p['daily'], color='#CBD5E1', label='actual daily demand')
+ax0 = ax[0].twinx(); ax0.plot(p['dates'], p['before'], color='#64748B', label='stock – before AI'); ax0.plot(p['dates'], p['after'], color='#0D9488', lw=2, label='stock – after AI')
+ax0.axhline(p['s_before'], color='#64748B', ls='--'); ax0.step(pd.to_datetime(p['weeks']) - pd.Timedelta(days=6), p['s_after'], where='post', color='#D97706', ls=':', label='AI weekly ROP')
+ax0.legend(fontsize=8, loc='upper left'); ax[0].set_title(f'{SKU}: inventory replay on real demand')
+r_ = roll[roll.sku == SKU]
+ax[1].plot(r_.week, r_.actual, color='#2563EB', label='actual'); ax[1].plot(r_.week, r_.forecast_1, color='#0D9488', lw=2, label='AI 1-week-ahead')
+ax[1].axhline(y.iloc[:-26].mean(), color='#64748B', ls='--', label='before: historical mean'); ax[1].legend(fontsize=8); ax[1].set_title('Static average vs self-retraining AI')
+plt.tight_layout(); plt.savefig(FIG / 'fig_before_after.png', dpi=160); plt.show()
+""")
+md("""
+**Reading.** The AI policy follows the pre-Christmas surge week by week, so it loses fewer sales, has fewer stockout days, a higher fill rate and a smaller forecast error at a slightly lower total cost. It holds more stock on average, because shortages here cost more than holding. It is not better on every SKU (see the per-SKU count), and the classic policy's σ of all history already carries a large, blunt buffer. The biggest cost lever is the Bayesian optimisation of (s, Q) in §7.
+
+## 9. AI automation — the system runs itself
+1. **Drift detection & auto-retraining:** tracking signal |TS| > 4 (with a cooldown) triggers model re-selection; a scheduled retrain runs every 4 weeks.
+2. **Anomaly detection:** an Isolation Forest over weekly demand features (robust z-score, ratio to the rolling median, % change) flags spikes and drops.
+3. **ML segmentation:** ABC (revenue) × XYZ (variability) plus K-means clusters on volume, CV, trend, seasonality and intermittency → a service level per segment.
+4. **Replenishment agent:** perceive → reason (5,000 Monte Carlo scenarios per SKU) → decide (expedite / order / watch / hold) → act (draft POs with a written rationale, for human approval).
+5. **Exception digest:** an auto-written daily briefing.
+""")
+code("""
+anom = A.detect_anomalies(df)
+print('Anomalies flagged:', int(anom.anomaly.sum()), 'of', len(anom), 'SKU-weeks'); display(anom[anom.anomaly].sort_values('score', ascending=False).head(5)[['sku','week','demand','robust_z','type','score']].round(2))
+display(seg.groupby(['segment']).agg(skus=('sku','count'), service=('ai_service','first')).T)
+display(seg.groupby('cluster_name').agg(skus=('sku','count'), mean_wk=('mean_wk','mean'), cv=('cv','mean')).round(2))
+""")
+md("""
+## 10. Portfolio application — autonomous agent run (all 40 SKUs)
 The same pipeline is applied to every SKU. Stock on hand is **not** in the source data, so a seeded scenario (ROP × U(0.35, 2.2)) is used to demonstrate the inventory-status logic.
 """)
 code("""
@@ -249,16 +310,26 @@ port['status'] = [I.classify(o, s_, r, d * 2) for o, s_, r, d in zip(port['on_ha
 print(port.status.value_counts().to_string()); print(f"Median portfolio WAPE: {port['WAPE %'].median():.1f}%")
 display(port.sort_values('risk', ascending=False).head(10).round(2))
 port.to_csv(FIG / 'portfolio_results.csv', index=False)
+P_ = port.rename(columns={'forecast/wk': 'd_bar', 'σ_err': 'sd_d', 'on_hand (simulated)': 'on_hand', 'WAPE %': 'fc_wape', 'ROP': 'rop'})
+P_['inv_position'] = P_['on_hand']; P_['description'] = P_.sku.map(df.groupby('sku').description.first())
+pr = df.groupby('sku').avg_price.mean(); P_['unit_cost'] = P_.sku.map(pr) * 0.6
+P_['eoq'] = [max(1, I.eoq(d * 52, 40, c * .25)) for d, c in zip(P_.d_bar, P_.unit_cost)]
+P_ = P_.merge(seg[['sku', 'segment', 'ai_service']], on='sku').rename(columns={'ai_service': 'svc'})
+R, alog = A.agent_decisions(P_, 2, 4/7)
+for l in alog: print(f"[{l['step']}] {l['detail']}")
+display(R[['action','sku','description','segment','order_qty','p_stockout','rationale']].head(8))
+print(A.digest(R, anom, rlog, seg, 'notebook run')[:1200])
 """)
 md("""
-## 9. Results & business interpretation
+## 11. Results & business interpretation
 * **Forecasting:** statistical/ML models clearly beat the naive benchmark on WAPE; selection is done on validation folds only, so test errors are an unbiased estimate. Retail SKU demand remains noisy (portfolio median WAPE ≈ 35–45%), which is exactly why safety stock is needed.
 * **Dynamic safety stock:** using forecast-error variability rather than raw demand variability makes the buffer *adapt* as the model improves or data changes. Lead-time uncertainty contributes a large share of the buffer variance → supplier reliability is a key lever.
 * **Monte Carlo:** validates the formula under its assumptions and quantifies how much extra buffer skewed lead times, correlation and stress scenarios require.
 * **Bayesian optimisation:** finds a lower-cost (s, Q) policy that meets the fill-rate, capacity, budget and MOQ constraints in only 40 simulations — instead of a grid of hundreds — and the improvement is confirmed on an independent simulation.
+* **Before vs after AI:** on 26 weeks of real demand the AI policy cuts lost sales and stockout days, raises the fill rate and lowers the forecast error at a slightly lower cost; it decides, monitors, retrains and drafts orders on its own, while the human approves.
 
-## 10. Conclusion
-The exercise upgrades a static reorder-point calculator into an adaptive system: **(1)** ML forecasts that retrain when new data arrives, **(2)** probabilistic, simulation-checked safety stocks, and **(3)** Bayesian optimisation of reorder decisions under real operational constraints. The interactive Streamlit dashboard exposes every step with sliders and live KPIs.
+## 12. Conclusion
+The exercise upgrades a static (pre-AI) reorder-point calculator into an autonomous AI system: **(1)** ML forecasts that retrain on new data and on drift, **(2)** probabilistic, conformal and Monte Carlo safety stocks with cost-aware, segment-specific service levels, **(3)** Bayesian optimisation of reorder decisions under real constraints, and **(4)** an agent that detects anomalies, drafts purchase orders and reports exceptions. The Streamlit dashboard shows Before vs After AI side by side, with sliders and live KPIs.
 
 **Limitations:** lead times, costs and stock levels are assumptions (absent from the public data); refresh is on-demand batch rather than a live feed; LSTM was not justified at this series length.
 

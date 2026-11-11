@@ -22,7 +22,7 @@ ROOT = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(ROOT / "src"))
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
-from inventory_core import data as D, forecasting as F, inventory as I, simulation as S, optimization as O  # noqa: E402
+from inventory_core import data as D, forecasting as F, inventory as I, simulation as S, optimization as O, automation as A  # noqa: E402
 import ui  # noqa: E402
 
 st.set_page_config(page_title="AI Inventory Intelligence | Krishna Mathur", page_icon="📦", layout="wide",
@@ -32,7 +32,7 @@ STUDENT = {"name": "Krishna Mathur", "id": "AS25DXB018", "prog": "MAIB", "batch"
            "school": "SP Jain School of Global Management", "course": "AI in Operations",
            "lab": "Session II – Laboratory Exercise", "instructor": "Dr. Sandip Kumar Roy"}
 DEFAULTS = dict(theme_mode="Dark", service=0.95, lt_days=14.0, lt_sd_days=4.0, basis="AI forecast (dynamic)",
-                window=52, cost_pct=0.60, holding_rate=0.25, order_cost=40.0, short_mult=1.0, stock_seed=7)
+                window=52, cost_pct=0.60, holding_rate=0.25, order_cost=40.0, short_mult=1.0, stock_seed=7, ai_svc=True)
 
 # ------------------------------------------------------------------ session state
 ss = st.session_state
@@ -65,6 +65,11 @@ SC = ui.status_colors(T)
 
 
 def fig_(fig, h=360, legend=True, **kw):
+    """Render a Plotly figure. The title is rendered as HTML above the chart so it can never collide with the legend."""
+    title = fig.layout.title.text
+    if title:
+        st.markdown(f"<div class='chart-title'>{title}</div>", unsafe_allow_html=True)
+        fig.update_layout(title=None)
     return st.plotly_chart(ui.style_fig(fig, T, h, legend), width="stretch",
                            config={"displaylogo": False, "toImageButtonOptions": {"scale": 2}}, **kw)
 
@@ -125,6 +130,37 @@ def stl(y: pd.Series, period: int):
     return pd.DataFrame({"observed": y, "trend": r.trend, "seasonal": r.seasonal, "resid": r.resid})
 
 
+@st.cache_data(show_spinner=False)
+def run_segment(df):
+    return A.segment(df)
+
+
+@st.cache_data(show_spinner=False)
+def run_anomalies(df):
+    return A.detect_anomalies(df)
+
+
+@st.cache_data(show_spinner=False)
+def load_rolling(df):
+    """Walk-forward AI forecasts. Uses the pre-computed file when the data is the original dataset,
+    otherwise recomputes (weekly refit + drift-triggered re-selection) for the current data."""
+    f, l = ROOT / "data/processed/ai_rolling_forecasts.csv", ROOT / "data/processed/ai_retrain_log.csv"
+    orig = D.load_default()
+    if f.exists() and len(df) == len(orig) and float(df["demand"].sum()) == float(orig["demand"].sum()):
+        r = pd.read_csv(f, dtype={"sku": str}, parse_dates=["week"])
+        lg = pd.read_csv(l, dtype={"sku": str}) if l.exists() else pd.DataFrame()
+        return r, lg, "pre-computed walk-forward run on the original dataset"
+    bar = st.progress(0.0, text="Re-running walk-forward AI forecasts on the updated data…")
+    r, lg = A.rolling_ai_all(df, 26, progress=lambda i, n, s_: bar.progress(i / n, text=f"Walk-forward retraining {i}/{n} · {s_}"))
+    bar.empty()
+    return r, lg, "recomputed after data update"
+
+
+@st.cache_data(show_spinner=False)
+def run_before_after(df, roll, service, lt, ltsd, cost_pct, hr, oc, sm, seg, use_seg):
+    return A.before_after(df, roll, service, lt, ltsd, cost_pct, hr, oc, sm, seg if use_seg else None)
+
+
 # ------------------------------------------------------------------ sidebar
 with st.sidebar:
     st.markdown(f"""<div class='side-brand'><div class='n'>📦 InvenTwin AI</div>
@@ -142,6 +178,8 @@ with st.sidebar:
     st.markdown("**Service & supply assumptions**")
     st.slider("Target cycle service level (α)", 0.80, 0.999, key="service", step=0.005, format="%.3f",
               help="Probability of no stockout during a replenishment lead time.")
+    st.toggle("AI service level per ML segment", key="ai_svc",
+              help="ON: the AI assigns α per ABC-XYZ segment (A-items 95–98 %, C-items 90–94 %). OFF: one α for every SKU (classic practice).")
     st.slider("Mean supplier lead time (days)", 1.0, 60.0, key="lt_days", step=1.0,
               help="Not present in the dataset → configurable scenario assumption.")
     st.slider("Lead-time std. deviation (days)", 0.0, 20.0, key="lt_sd_days", step=0.5)
@@ -156,7 +194,7 @@ with st.sidebar:
     with st.expander("🧪 Inventory scenario", expanded=False):
         st.number_input("Simulated stock seed", 0, 9999, key="stock_seed",
                         help="The dataset has no stock-on-hand. Scenario stock = baseline ROP × U(0.35, 2.2) with this seed.")
-        st.caption("Edit individual stock levels in **Inventory Intelligence → Edit scenario stock**.")
+        st.caption("Edit individual stock levels in **AI Autopilot → Edit scenario stock**.")
     if st.button("↺ Reset scenario", width="stretch"):
         for k, v in DEFAULTS.items():
             if k != "theme_mode":
@@ -172,6 +210,9 @@ L_wk, sdL_wk = ss.lt_days / 7, ss.lt_sd_days / 7
 svc = ss.service
 w = ss.window
 P = base.copy()
+SEG = run_segment(ss.df)
+P = P.merge(SEG[["sku", "segment", "cluster_name", "ai_service"]], on="sku", how="left")
+P["svc"] = P["ai_service"].fillna(svc) if ss.ai_svc else svc
 if ss.basis.startswith("AI"):
     P["d_bar"], P["sd_d"] = P["fc_mean"], P["fc_err_sd"]
 else:
@@ -179,7 +220,7 @@ else:
 P["unit_cost"] = P["price"] * ss.cost_pct
 P["ltd_mean"] = P["d_bar"] * L_wk
 P["sigma_ltd"] = np.sqrt(P["sd_d"] ** 2 * L_wk + P["d_bar"] ** 2 * sdL_wk ** 2)
-P["ss"] = I.z_value(svc) * P["sigma_ltd"]
+P["ss"] = norm.ppf(P["svc"]) * P["sigma_ltd"]
 P["rop"] = P["ltd_mean"] + P["ss"]
 P["eoq"] = [max(1.0, I.eoq(d * 52, ss.order_cost, c * ss.holding_rate)) for d, c in zip(P["d_bar"], P["unit_cost"])]
 # simulated stock is anchored to a FIXED baseline ROP (95%, 14 d ± 4 d, 52-wk history) so sliders move ROP, not stock
@@ -209,8 +250,9 @@ st.markdown(f"""
 <div class='hero'>
   <div class='eyebrow'>{STUDENT['course']} · {STUDENT['lab']}</div>
   <h1>AI-Powered Inventory Intelligence &amp; Reorder Point Optimization</h1>
-  <div class='sub'>Machine-learning demand forecasting · probabilistic dynamic safety stock with Monte Carlo simulation ·
-  Bayesian optimisation of reorder points under operational constraints.</div>
+  <div class='sub'>From a static textbook reorder-point calculator to an autonomous AI system: self-retraining ML forecasts ·
+  drift &amp; anomaly detection · ML segmentation · Monte Carlo safety stock · Bayesian-optimised reorder points · an
+  auto-replenishment agent.</div>
   <div class='chips'>
     <span class='chip'>👤 <b>{STUDENT['name']}</b> · {STUDENT['id']}</span>
     <span class='chip'>🎓 {STUDENT['prog']} · {STUDENT['batch']}</span>
@@ -221,114 +263,278 @@ st.markdown(f"""
   </div>
 </div>""", unsafe_allow_html=True)
 
-tabs = st.tabs([":material/space_dashboard: Overview", ":material/insights: Demand Forecasting",
-                ":material/shield: Safety Stock & ROP", ":material/casino: Monte Carlo Risk",
-                ":material/psychology: Bayesian Optimization", ":material/inventory_2: Inventory Intelligence",
-                ":material/database: Data Manager", ":material/summarize: Reports & Diagnostics",
-                ":material/menu_book: Methodology"])
+COLS = ["sku", "description", "segment", "status", "fc_total4", "d_bar", "on_hand", "on_order", "inv_position", "ss", "rop",
+        "order_qty", "risk", "weeks_cover", "stock_value", "action"]
+tabs = st.tabs([":material/compare_arrows: Before vs After AI", ":material/smart_toy: AI Autopilot",
+                ":material/insights: 1 · Demand Forecasting", ":material/shield: 2 · Safety Stock & Monte Carlo",
+                ":material/psychology: 3 · Bayesian Optimization", ":material/database: Data & Reports"])
 
-# ================================================================== TAB 1 · OVERVIEW
+# ================================================================== TAB 1 · BEFORE vs AFTER AI
 with tabs[0]:
-    tot_fc = P["fc_total4"].sum()
-    alerts = P[P["status"].isin(["Reorder Now", "Critical Stockout Risk"])]
-    crit = (P["status"] == "Critical Stockout Risk").sum()
-    exp_service = 1 - P["risk"].mean()
-    units_risk = (P["risk"] * P["ltd_mean"]).sum()
+    st.markdown(ui.section("Before AI vs After AI", "Same real demand, same suppliers, same costs — only the decision method changes", "head-to-head"), unsafe_allow_html=True)
+    st.markdown(f"""<div class='compare-grid'><div class='card compare before'><h4>⏮ Before AI — classic textbook reorder point</h4><ul>
+      <li>Average &amp; σ of <b>all past demand</b>, computed once</li>
+      <li>One service level for <b>every</b> SKU</li>
+      <li>Formula SS = Z√(σ²L + D̄²σ²<sub>L</sub>) set once, <b>never revised</b></li>
+      <li>EOQ order quantity; manual what-if sweeps in a spreadsheet</li>
+      <li>No monitoring — errors are found after the stockout</li>
+      <li>Planner reviews every SKU by hand</li></ul></div><div class='card compare after'><h4>⏭ After AI — what the AI does here</h4><ul>
+      <li><b>Learns continuously</b>: forecast refit every week; drift alarms trigger champion/challenger re-selection (ETS ↔ gradient boosting)</li>
+      <li><b>Corrects itself</b>: recent under-forecasting bias is detected and added back</li>
+      <li><b>Learns its own uncertainty</b>: conformal buffer = α-quantile of its realised lead-time forecast errors</li>
+      <li><b>Decides service economically</b>: cost-optimal α per SKU, floored by the ML segment (ABC-XYZ + K-means)</li>
+      <li><b>Optimises</b> (s, Q) with Bayesian optimisation instead of sweeps</li>
+      <li><b>Acts</b>: agent flags anomalies, drafts POs and writes the daily digest</li></ul></div></div>""", unsafe_allow_html=True)
+
+    roll, rlog, roll_src = load_rolling(ss.df)
+    BA, PATHS = run_before_after(ss.df, roll, svc, ss.lt_days, ss.lt_sd_days, ss.cost_pct, ss.holding_rate, ss.order_cost,
+                                 ss.short_mult, SEG, ss.ai_svc)
+    tot = lambda c: BA[c].sum()
+    dem_total = roll.groupby("sku")["actual"].sum().sum()
+    fr_b, fr_a = 1 - tot("before_units_short") / dem_total, 1 - tot("after_units_short") / dem_total
+    cb, ca = tot("before_total_cost"), tot("after_total_cost")
+    wape_b = float((BA["wape_before"] * roll.groupby("sku")["actual"].sum().reindex(BA["sku"]).values).sum() / dem_total)
+    wape_a = float((BA["wape_after"] * roll.groupby("sku")["actual"].sum().reindex(BA["sku"]).values).sum() / dem_total)
+    n_drift = int(rlog["event"].astype(str).str.startswith("drift").sum()) if len(rlog) else 0
+    n_switch = int(rlog["switched"].sum()) if len(rlog) else 0
+
+    def delta(b, a, good_low=True, pct=True, unit=""):
+        better = (a < b) if good_low else (a > b)
+        cls = "up" if better else "down"
+        d = (a - b) / abs(b) * 100 if pct and b else a - b
+        return f"<span class='{cls}'>{d:+.1f}{'%' if pct else unit}</span> vs before"
     st.markdown(ui.kpi_row([
-        ui.kpi("SKUs analysed", fmt(len(P)), f"{ss.df['date'].min():%b %Y} → {ss.df['date'].max():%b %Y}", "▦", T["primary"]),
-        ui.kpi("Forecast demand · next 4 wks", fmt(tot_fc), f"ETS ensemble · median WAPE {P['fc_wape'].median():.1f}%", "↗", T["blue"], "units"),
-        ui.kpi("Avg weekly demand / SKU", fmt(P["d_bar"].mean()), f"basis: {ss.basis.split(' (')[0]}", "∿", T["primary"], "units"),
-        ui.kpi("Inventory on hand", fmt(P["on_hand"].sum()), f"≈ £{P['stock_value'].sum():,.0f} at cost · <b>simulated</b>", "▣", T["amber"], "units"),
+        ui.kpi_ba("Fill rate", f"{fr_b:.1%}", f"{fr_a:.1%}", delta(fr_b * 100, fr_a * 100, False, False, " pp"), "◐", T["green"]),
+        ui.kpi_ba("Stockout days", f"{tot('before_stockout_days'):,}", f"{tot('after_stockout_days'):,}", delta(tot('before_stockout_days'), tot('after_stockout_days')), "⚠", T["red"]),
+        ui.kpi_ba("Total cost · 26 wks", f"£{cb:,.0f}", f"£{ca:,.0f}", delta(cb, ca), "£", T["primary"]),
+        ui.kpi_ba("Forecast WAPE", f"{wape_b:.0f}%", f"{wape_a:.0f}%", delta(wape_b, wape_a), "◎", T["blue"]),
+    ]) + ui.kpi_row([
+        ui.kpi_ba("Lost sales (units)", f"{tot('before_units_short'):,.0f}", f"{tot('after_units_short'):,.0f}", delta(tot('before_units_short'), tot('after_units_short')), "↯", T["orange"]),
+        ui.kpi_ba("Avg stock value", f"£{tot('before_inv_value'):,.0f}", f"£{tot('after_inv_value'):,.0f}", delta(tot('before_inv_value'), tot('after_inv_value')), "▣", T["amber"]),
+        ui.kpi("Automatic retrains", f"{len(rlog):,}", f"{n_drift} drift-triggered · {n_switch} model switches", "⟳", T["primary"]),
+        ui.kpi("AI cheaper on", f"{(BA['after_total_cost'] < BA['before_total_cost']).sum()}/{len(BA)} SKUs", f"fill rate up on {(BA['after_fill_rate'] > BA['before_fill_rate'] + 1e-9).sum()} SKUs", "✓", T["green"]),
     ]), unsafe_allow_html=True)
-    st.markdown(ui.kpi_row([
-        ui.kpi("Avg safety stock / SKU", fmt(P["ss"].mean()), f"Z = {I.z_value(svc):.3f} · α = {svc:.1%}", "⛨", T["primary"], "units"),
-        ui.kpi("Reorder-point alerts", f"{len(alerts)}", f"<span class='down'>{crit} critical</span> · {len(alerts) - crit} reorder now", "⚑", T["orange"]),
-        ui.kpi("Expected service level", f"{exp_service:.1%}", f"target {svc:.1%} · " + (f"<span class='up'>on target</span>" if exp_service >= svc else f"<span class='down'>{(svc - exp_service) * 100:.1f} pp gap</span>"), "✓", T["green"]),
-        ui.kpi("Est. stockout risk", f"{P['risk'].mean():.1%}", f"≈ {units_risk:,.0f} units of LT demand exposed", "⚠", T["red"]),
-    ]), unsafe_allow_html=True)
+    st.caption(f"Replay on the **last 26 weeks of actual daily demand** ({roll['week'].min():%d %b %Y} – {roll['week'].max():%d %b %Y}) for all {len(BA)} SKUs, "
+               f"lost-sales (s, Q) policies, identical seeded Gamma lead times ({ss.lt_days:.0f} ± {ss.lt_sd_days:.0f} d) for both methods. "
+               f"Before: α = {svc:.1%} for all SKUs, all-history mean/σ. After: cost-optimal α (avg {BA['ai_service'].mean():.1%}) floored at {'the ML-segment α' if ss.ai_svc else f'{svc:.1%}'} · forecasts: {roll_src}. Change any sidebar slider to re-run.")
 
-    c1, c2 = st.columns([2.1, 1])
+    c1, c2 = st.columns([1.15, 1], gap="medium")
     with c1:
-        st.markdown(ui.section("Portfolio demand trend", "Weekly units, all SKUs · with 4-week AI forecast", "observed"), unsafe_allow_html=True)
-        agg = ss.df.set_index("date")["demand"].resample("W-SUN").sum().iloc[1:-1]
-        agg_ma = agg.rolling(8).mean()
-        fidx = pd.date_range(agg.index[-1] + pd.Timedelta(weeks=1), periods=4, freq="W-SUN")
+        pth = PATHS[FOCUS]
+        fig = make_subplots(specs=[[{"secondary_y": True}]])
+        fig.add_trace(go.Bar(x=pth["dates"], y=pth["daily"], name="Actual daily demand", marker_color=T["grid"].replace("0.14", "0.45").replace("0.08", "0.35"), opacity=0.9), secondary_y=True)
+        fig.add_trace(go.Scatter(x=pth["dates"], y=pth["before"], name="Stock · before AI", line=dict(color=T["muted"], width=2)))
+        fig.add_trace(go.Scatter(x=pth["dates"], y=pth["after"], name="Stock · after AI", line=dict(color=T["primary"], width=2.5)))
+        wk = pd.to_datetime(pth["weeks"]) - pd.Timedelta(days=6)
+        fig.add_trace(go.Scatter(x=wk, y=pth["s_after"], name="AI reorder point (weekly)", line=dict(color=T["amber"], dash="dot", shape="hv")))
+        fig.add_hline(y=pth["s_before"], line=dict(color=T["muted"], dash="dash"), annotation_text="static ROP", annotation_font_color=T["muted"])
+        so_b = pth["dates"][(pth["before"] <= 0) & (pth["daily"] > 0)]
+        fig.add_trace(go.Scatter(x=so_b, y=np.zeros(len(so_b)), mode="markers", name="Stockout · before", marker=dict(color=T["red"], symbol="x", size=7)))
+        fig.update_layout(title=f"{FOCUS} · {FR['description'][:32]} — inventory replay on real demand", barmode="overlay")
+        fig.update_yaxes(title_text="units on hand", secondary_y=False)
+        fig.update_yaxes(showgrid=False, title_text="daily demand", secondary_y=True)
+        fig_(fig, 420)
+    with c2:
+        r_ = roll[roll.sku == FOCUS]
+        y_tr = D.series(ss.df, FOCUS, "W")
+        static_mean = y_tr.iloc[: len(y_tr) - 26].mean()
         fig = go.Figure()
-        fig.add_trace(go.Scatter(x=agg.index, y=agg, name="Weekly demand", mode="lines", line=dict(color=T["blue"], width=1.6),
-                                 fill="tozeroy", fillcolor="rgba(96,165,250,0.08)"))
-        fig.add_trace(go.Scatter(x=agg.index, y=agg_ma, name="8-wk moving avg", line=dict(color=T["primary"], width=2.5)))
-        fig.add_trace(go.Scatter(x=[agg.index[-1], *fidx], y=[agg.iloc[-1], *[tot_fc / 4] * 4], name="AI forecast",
-                                 line=dict(color=T["amber"], width=2.5, dash="dot")))
-        fig_(fig, 340)
-    with c2:
-        st.markdown(ui.section("Inventory health", "Status mix at current settings"), unsafe_allow_html=True)
-        cnt = P["status"].value_counts().reindex(I.STATUS_ORDER).fillna(0)
-        fig = go.Figure(go.Pie(labels=cnt.index, values=cnt.values, hole=0.68, sort=False,
-                               marker=dict(colors=[SC[s] for s in cnt.index], line=dict(color=T["bg"], width=3)),
-                               textinfo="value", textfont=dict(size=13)))
-        fig.add_annotation(text=f"<b>{int(cnt.get('Healthy', 0))}/{len(P)}</b><br><span style='font-size:11px'>healthy</span>",
-                           showarrow=False, font=dict(size=20, color=T["text"]))
-        fig_(fig, 340)
+        fig.add_trace(go.Scatter(x=r_["week"], y=r_["actual"], name="Actual", line=dict(color=T["blue"], width=2)))
+        fig.add_trace(go.Scatter(x=r_["week"], y=[static_mean] * len(r_), name="Before: historical mean", line=dict(color=T["muted"], dash="dash")))
+        fig.add_trace(go.Scatter(x=r_["week"], y=r_["forecast_1"], name="After: AI 1-week-ahead", line=dict(color=T["primary"], width=2.5)))
+        if len(rlog):
+            ev = rlog[rlog.sku == FOCUS]
+            evd = pd.to_datetime(ev["week"])
+            yv = r_.set_index("week")["actual"].reindex(evd).values
+            fig.add_trace(go.Scatter(x=evd, y=yv, mode="markers", name="Auto-retrain / drift",
+                                     marker=dict(symbol=np.where(ev["event"].str.startswith("drift"), "star", "circle-open"), size=12, color=T["amber"]),
+                                     hovertext=ev["event"] + " → " + ev["champion"]))
+        fig.update_layout(title="Forecast: static average vs self-retraining AI")
+        fig_(fig, 420)
 
-    c1, c2 = st.columns([1.25, 1])
+    c1, c2 = st.columns([1.15, 1], gap="medium")
     with c1:
-        st.markdown(ui.section("Inventory position vs reorder point", "Top 15 SKUs by risk · bar = position, ◆ = ROP, ┃ = safety stock"), unsafe_allow_html=True)
-        top = P.sort_values(["status_rank", "risk"], ascending=[True, False]).head(15).iloc[::-1]
+        d = BA.assign(desc=BA["sku"].map(labels)).sort_values("before_total_cost")
         fig = go.Figure()
-        fig.add_trace(go.Bar(y=top["sku"] + " " + top["description"].str[:18], x=top["inv_position"], orientation="h",
-                             marker=dict(color=[SC[s] for s in top["status"]], cornerradius=5), name="Inventory position",
-                             hovertemplate="%{y}<br>Position %{x:,.0f}<extra></extra>"))
-        fig.add_trace(go.Scatter(y=top["sku"] + " " + top["description"].str[:18], x=top["rop"], mode="markers", name="Reorder point",
-                                 marker=dict(symbol="diamond", size=11, color=T["text"], line=dict(color=T["bg"], width=1))))
-        fig.add_trace(go.Scatter(y=top["sku"] + " " + top["description"].str[:18], x=top["ss"], mode="markers", name="Safety stock",
-                                 marker=dict(symbol="line-ns-open", size=14, color=T["primary"], line=dict(width=3))))
-        fig_(fig, 470)
+        for r in d.itertuples():
+            fig.add_trace(go.Scatter(x=[r.before_total_cost, r.after_total_cost], y=[r.sku, r.sku], mode="lines",
+                                     line=dict(color=T["green"] if r.after_total_cost < r.before_total_cost else T["red"], width=2), showlegend=False, hoverinfo="skip"))
+        fig.add_trace(go.Scatter(x=d["before_total_cost"], y=d["sku"], mode="markers", name="Before AI", marker=dict(color=T["muted"], size=8)))
+        fig.add_trace(go.Scatter(x=d["after_total_cost"], y=d["sku"], mode="markers", name="After AI", marker=dict(color=T["primary"], size=9)))
+        fig.update_layout(title="Cost per SKU over 26 weeks (green = AI cheaper)", xaxis_tickprefix="£", xaxis_type="log")
+        fig.update_yaxes(tickfont=dict(size=9))
+        fig_(fig, 640)
     with c2:
-        st.markdown(ui.section("Demand seasonality", "Total units · month × year (observed)"), unsafe_allow_html=True)
-        m = ss.df.assign(Y=ss.df["date"].dt.year, M=ss.df["date"].dt.month).groupby(["Y", "M"])["demand"].sum().unstack(0)
-        m.index = [pd.Timestamp(2000, i, 1).strftime("%b") for i in m.index]
-        fig = go.Figure(go.Heatmap(z=m.values, x=[str(c) for c in m.columns], y=m.index, colorscale=[[0, T["surface2"]], [0.5, T["blue"]], [1, T["primary"]]],
-                                   hovertemplate="%{y} %{x}: %{z:,.0f} units<extra></extra>", xgap=3, ygap=3,
-                                   colorbar=dict(thickness=10, outlinewidth=0)))
-        fig.update_yaxes(autorange="reversed")
-        fig_(fig, 470, legend=False)
+        fig = px.scatter(BA.assign(desc=BA["sku"].map(labels)), x="before_fill_rate", y="after_fill_rate", hover_name="sku",
+                         hover_data={"desc": True}, color_discrete_sequence=[T["primary"]])
+        fig.add_shape(type="line", x0=0.5, y0=0.5, x1=1, y1=1, line=dict(color=T["muted"], dash="dot"))
+        fig.update_traces(marker=dict(size=10, line=dict(color=T["bg"], width=1)))
+        fig.update_layout(title="Fill rate per SKU (above the line = AI better)", xaxis_tickformat=".0%", yaxis_tickformat=".0%",
+                          xaxis_title="Before AI", yaxis_title="After AI")
+        fig_(fig, 330, legend=False)
+        st.markdown(ui.section("Work automated", "manual task → what the system does now"), unsafe_allow_html=True)
+        st.dataframe(pd.DataFrame([
+            ["Update demand averages", "Monthly, by hand", "Every data load, automatic"],
+            ["Choose forecasting method", "Fixed", "Champion/challenger on drift"],
+            ["Spot unusual demand", "Not done", "Isolation Forest alerts"],
+            ["Set service levels", "One for all", "Per ML segment"],
+            ["Size buffers", "Formula once", "Conformal + Monte Carlo"],
+            ["Correct forecast bias", "Not done", "Automatic (tracking signal)"],
+            ["Tune s and Q", "Spreadsheet sweep", "Bayesian optimisation"],
+            ["Decide who to reorder", f"Review {len(P)} SKUs", "Agent drafts POs + reasons"],
+        ], columns=["Task", "Before AI", "After AI"]), hide_index=True, width="stretch")
+    with st.expander("Per-SKU before/after table & honest reading of the result"):
+        show = BA[["sku", "ai_service", "before_fill_rate", "after_fill_rate", "before_stockout_days", "after_stockout_days",
+                   "before_total_cost", "after_total_cost", "before_inv_value", "after_inv_value", "wape_before", "wape_after"]].copy()
+        show.insert(1, "description", show["sku"].map(labels))
+        st.dataframe(show, hide_index=True, width="stretch", column_config={
+            c: st.column_config.NumberColumn(format="percent") for c in ["ai_service", "before_fill_rate", "after_fill_rate"]} | {
+            c: st.column_config.NumberColumn(format="£%.0f") for c in ["before_total_cost", "after_total_cost", "before_inv_value", "after_inv_value"]} | {
+            c: st.column_config.NumberColumn(format="%.1f") for c in ["wape_before", "wape_after"]})
+        st.download_button("⬇ Download before/after results (CSV)", show.to_csv(index=False).encode(), "before_vs_after_ai.csv", "text/csv")
+        st.markdown("""**Honest reading.** The hold-out (Jun – Dec 2011) contains the pre-Christmas surge. The classic policy's σ of
+        *all* history already includes last year's seasonal swing, so it carries a large, blunt buffer. The AI policy follows the surge
+        week by week, cuts lost sales and stockout days and raises the fill rate at a similar or lower total cost — but it is not
+        better on every SKU, and it may hold more stock where shortages are expensive. The largest cost saving comes from the
+        Bayesian optimisation of (s, Q) (Workstream 3 tab). All SKUs are listed so the trade-off is transparent.""")
 
-    c1, c2 = st.columns([1.6, 1])
-    with c1:
-        st.markdown(ui.section("Critical SKU watchlist", "Sorted by status then stockout risk"), unsafe_allow_html=True)
-        wl = P.sort_values(["status_rank", "risk"], ascending=[True, False]).head(12)
-        st.dataframe(wl[["sku", "description", "status", "inv_position", "rop", "ss", "risk", "weeks_cover", "action"]],
-                     hide_index=True, width="stretch", height=420, column_config={
-                         "sku": "SKU", "description": "Product", "status": "Status",
-                         "inv_position": st.column_config.NumberColumn("Position", format="%.0f"),
-                         "rop": st.column_config.NumberColumn("ROP", format="%.0f"),
-                         "ss": st.column_config.NumberColumn("Safety stock", format="%.0f"),
-                         "risk": st.column_config.ProgressColumn("Stockout risk", min_value=0, max_value=1, format="percent"),
-                         "weeks_cover": st.column_config.NumberColumn("Wks cover", format="%.1f"),
-                         "action": "Recommended action"})
-    with c2:
-        st.markdown(ui.section("AI recommendations", "Generated from current computations"), unsafe_allow_html=True)
-        recs = []
-        if crit:
-            c_ = P[P["status"] == "Critical Stockout Risk"].sort_values("risk", ascending=False)
-            recs.append((T["red"], f"Expedite {crit} critical SKU(s)", f"{', '.join(c_['sku'].head(4))} cannot cover expected lead-time demand ({L_wk * 7:.0f} days). Place {c_['order_qty'].sum():,.0f} units of orders now."))
-        rn = P[P["status"] == "Reorder Now"]
-        if len(rn):
-            recs.append((T["orange"], f"Raise POs for {len(rn)} SKU(s) at ROP", f"Total recommended order quantity {rn['order_qty'].sum():,.0f} units (EOQ-based)."))
-        over = P[P["weeks_cover"] > 12]
-        if len(over):
-            recs.append((T["amber"], f"{len(over)} SKU(s) overstocked (>12 wks cover)", f"≈ £{over['stock_value'].sum():,.0f} tied up; pause replenishment for {', '.join(over['sku'].head(3))}."))
-        share_lt = (P["d_bar"] ** 2 * sdL_wk ** 2 / P["sigma_ltd"].clip(lower=1e-9) ** 2).mean()
-        recs.append((T["blue"], f"Lead-time uncertainty drives {share_lt:.0%} of buffer variance",
-                     "Reducing supplier lead-time σ is the cheapest lever." if share_lt > 0.5 else "Demand variability dominates — invest in forecast accuracy (see Forecasting tab)."))
-        worst = P.sort_values("fc_wape", ascending=False).iloc[0]
-        recs.append((T["primary"], f"Forecastability: median WAPE {P['fc_wape'].median():.0f}%",
-                     f"Least predictable: {worst['sku']} ({worst['fc_wape']:.0f}% WAPE) — use the Monte Carlo tab to size its buffer empirically."))
-        st.markdown("".join(f"<div class='reco'><div class='dot' style='background:{c}'></div><div><div class='t'>{t}</div><div class='d'>{d}</div></div></div>" for c, t, d in recs), unsafe_allow_html=True)
-    st.caption("Data provenance: demand & price = **observed** (UCI Online Retail II) · forecasts/SS/ROP = **derived** · service, lead time, costs = **configured** · stock on hand = **simulated scenario** (not in source data).")
-
-# ================================================================== TAB 2 · FORECASTING
+# ================================================================== TAB 2 · AI AUTOPILOT
 with tabs[1]:
+    st.markdown(ui.section("AI Autopilot · command centre", "Runs automatically on every data load — or on demand", "autonomous"), unsafe_allow_html=True)
+    ANOM = run_anomalies(ss.df)
+    roll, rlog, _ = load_rolling(ss.df)
+    sig = (len(ss.df), float(ss.df["demand"].sum()), svc, ss.lt_days, ss.lt_sd_days, ss.ai_svc, ss.basis, ss.window,
+           ss.cost_pct, ss.order_cost, ss.holding_rate, ss.stock_seed, str(ss.stock_edits))
+    c1, c2 = st.columns([3, 1], gap="medium", vertical_alignment="center")
+    with c2:
+        manual = st.button("▶ Run AI Autopilot now", type="primary", width="stretch")
+    if manual or ss.get("agent_sig") != sig:
+        with st.spinner("Agent: perceive → reason → decide → act…"):
+            R, alog = A.agent_decisions(P, L_wk, sdL_wk, today=ss.df["date"].max() + pd.Timedelta(days=1))
+        ss.agent = {"R": R, "log": alog, "at": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+                    "trigger": "manual run" if manual else ("data / settings change" if ss.get("agent_sig") else "app start")}
+        ss.agent_sig = sig
+    R, alog = ss.agent["R"], ss.agent["log"]
+    recent_anom = ANOM[(ANOM.anomaly) & (ANOM.week >= ANOM.week.max() - pd.Timedelta(weeks=4))]
+    n_drift = int(rlog["event"].astype(str).str.startswith("drift").sum()) if len(rlog) else 0
+    with c1:
+        st.markdown(f"<div style='font-size:.86rem;color:var(--muted)'>Last autonomous run <b style='color:var(--text)'>{ss.agent['at']}</b> · trigger: {ss.agent['trigger']} · "
+                    "on-demand batch — re-runs automatically whenever data or settings change.</div>", unsafe_allow_html=True)
+    steps = [("Ingest", f"{len(ss.df):,} rows"), ("Anomalies", f"{len(recent_anom)} new"),
+             ("Drift & retrain", f"{len(rlog)} retrains"), ("Forecast", f"{len(P)} SKUs"),
+             ("Segment", f"{SEG['segment'].nunique()} segments"), ("Simulate", f"{5000 * len(P) / 1e3:,.0f}k scenarios"),
+             ("Decide", f"{(R.order_qty > 0).sum()} POs"), ("Report", "digest")]
+    st.markdown("<div class='pipeline'>" + "".join(f"<div class='step'><div class='n'>{i + 1}</div><div><b>{a_}</b><span>{b_}</span></div></div>"
+                for i, (a_, b_) in enumerate(steps)) + "</div>", unsafe_allow_html=True)
+    exp, ordr = (R.action == "EXPEDITE").sum(), (R.action == "ORDER").sum()
+    st.markdown(ui.kpi_row([
+        ui.kpi("SKUs monitored", fmt(len(P)), f"{ss.df['date'].min():%b %Y} → {ss.df['date'].max():%b %Y}", "▦", T["primary"]),
+        ui.kpi("Forecast · 4 wks", fmt(P["fc_total4"].sum()), f"median WAPE {P['fc_wape'].median():.0f}%", "↗", T["blue"], "units"),
+        ui.kpi("Draft purchase orders", f"{exp + ordr}", f"<span class='down'>{exp} expedite</span> · {ordr} order · £{R['po_value'].sum():,.0f}", "⚑", T["orange"]),
+        ui.kpi("Avg stockout risk", f"{R['p_stockout'].mean():.1%}", f"{(R.p_stockout > 0.2).sum()} SKUs above 20%", "⚠", T["red"]),
+    ]) + ui.kpi_row([
+        ui.kpi("Avg safety stock / SKU", fmt(P["ss"].mean()), f"α {P['svc'].min():.0%}–{P['svc'].max():.0%} by segment" if ss.ai_svc else f"α = {svc:.1%} for all", "⛨", T["primary"], "units"),
+        ui.kpi("Anomalies · 4 wks", f"{len(recent_anom)}", f"{ANOM.anomaly.sum()} in full history (Isolation Forest)", "◉", T["amber"]),
+        ui.kpi("Drift alarms", f"{n_drift}", f"{len(rlog)} automatic retrains in walk-forward", "⟳", T["blue"]),
+        ui.kpi("Inventory on hand", fmt(P["on_hand"].sum()), f"£{P['stock_value'].sum():,.0f} at cost · <b>simulated</b>", "▣", T["amber"], "units"),
+    ]), unsafe_allow_html=True)
+
+    st.markdown(ui.section("Replenishment agent decisions", "MC-sized reorder points · draft POs need human approval"), unsafe_allow_html=True)
+    c = st.columns([1.3, 1, 1], gap="medium")
+    acts = ["EXPEDITE", "ORDER", "WATCH", "HOLD · overstock", "OK"]
+    fa = c[0].multiselect("Action filter", acts, ["EXPEDITE", "ORDER", "WATCH"], key="ag_f")
+    qs = c[1].text_input("Search SKU / product", key="ag_q")
+    segf = c[2].multiselect("Segment", sorted(R["segment"].dropna().unique()), key="ag_seg")
+    V = R[R.action.isin(fa)] if fa else R
+    if qs:
+        V = V[V.sku.str.contains(qs, case=False) | V.description.str.contains(qs, case=False)]
+    if segf:
+        V = V[V.segment.isin(segf)]
+    st.dataframe(V[["action", "sku", "description", "segment", "service", "order_qty", "po_value", "eta", "p_stockout", "days_cover", "rop_mc", "rop_formula", "confidence", "rationale"]],
+                 hide_index=True, width="stretch", height=380, column_config={
+                     "action": "Action", "sku": "SKU", "description": "Product", "segment": "Seg.",
+                     "service": st.column_config.NumberColumn("α", format="percent"),
+                     "order_qty": st.column_config.NumberColumn("Order qty", format="%.0f"),
+                     "po_value": st.column_config.NumberColumn("PO value", format="£%.0f"), "eta": "ETA",
+                     "p_stockout": st.column_config.ProgressColumn("P(stockout)", min_value=0, max_value=1, format="percent"),
+                     "days_cover": st.column_config.NumberColumn("Days cover", format="%.0f"),
+                     "rop_mc": st.column_config.NumberColumn("ROP (MC)", format="%.0f"),
+                     "rop_formula": st.column_config.NumberColumn("ROP (formula)", format="%.0f"),
+                     "confidence": st.column_config.ProgressColumn("Forecast conf.", min_value=0, max_value=1, format="percent"),
+                     "rationale": st.column_config.TextColumn("Why", width="large")})
+    po = R[R.order_qty > 0][["sku", "description", "order_qty", "po_value", "eta", "action", "rationale"]]
+    d1, d2, d3 = st.columns(3)
+    d1.download_button("⬇ Draft purchase orders (CSV)", po.to_csv(index=False).encode(), "draft_purchase_orders.csv", "text/csv", type="primary", width="stretch")
+    d2.download_button("⬇ All agent decisions (CSV)", R.to_csv(index=False).encode(), "agent_decisions.csv", "text/csv", width="stretch")
+    dg = A.digest(R, ANOM, rlog, SEG, ss.agent["at"])
+    d3.download_button("⬇ Exception digest (Markdown)", dg.encode(), "ai_exception_digest.md", "text/markdown", width="stretch")
+
+    c1, c2 = st.columns([1, 1], gap="medium")
+    with c1:
+        cnt = R["action"].value_counts().reindex(acts).fillna(0)
+        colmap = {"EXPEDITE": T["red"], "ORDER": T["orange"], "WATCH": T["amber"], "HOLD · overstock": T["blue"], "OK": T["green"]}
+        fig = go.Figure(go.Pie(labels=cnt.index, values=cnt.values, hole=0.66, sort=False, textinfo="value",
+                               marker=dict(colors=[colmap[a] for a in cnt.index], line=dict(color=T["bg"], width=3))))
+        fig.add_annotation(text=f"<b>{int(cnt.get('OK', 0))}/{len(R)}</b><br><span style='font-size:11px'>no action</span>", showarrow=False, font=dict(size=18, color=T["text"]))
+        fig.update_layout(title="Agent action mix", legend=dict(orientation="v", x=1.02, y=0.5, yanchor="middle"))
+        fig_(fig, 340)
+    with c2:
+        st.markdown(ui.section("Agent reasoning log"), unsafe_allow_html=True)
+        st.markdown("".join(f"<div class='reco'><div class='dot' style='background:{c_}'></div><div><div class='t'>{l['step']} · {l['time']}</div><div class='d'>{l['detail']}</div></div></div>"
+                            for l, c_ in zip(alog, [T["blue"], T["primary"], T["amber"], T["green"]])), unsafe_allow_html=True)
+
+    st.markdown(ui.section("Anomaly & drift alerts", "Isolation Forest on weekly demand · tracking-signal drift on forecasts", "ML"), unsafe_allow_html=True)
+    c1, c2 = st.columns([1.3, 1], gap="medium")
+    with c1:
+        yv = D.series(ss.df, FOCUS, "W")
+        an_ = ANOM[(ANOM.sku == FOCUS) & ANOM.anomaly]
+        fig = go.Figure()
+        fig.add_trace(go.Scatter(x=yv.index, y=yv, name="Weekly demand", line=dict(color=T["blue"], width=1.8)))
+        fig.add_trace(go.Scatter(x=an_["week"], y=an_["demand"], mode="markers", name="Anomaly",
+                                 marker=dict(size=12, color=np.where(an_["type"] == "Spike", T["red"], T["amber"]), symbol="circle-open", line=dict(width=3))))
+        fig.update_layout(title=f"{FOCUS} · anomalies detected by Isolation Forest")
+        fig_(fig, 340)
+    with c2:
+        al = ANOM[ANOM.anomaly].sort_values("week", ascending=False).head(25).assign(description=lambda d: d.sku.map(labels))
+        st.dataframe(al[["week", "sku", "description", "type", "demand", "robust_z", "score"]], hide_index=True, width="stretch", height=340,
+                     column_config={"week": st.column_config.DateColumn("Week", format="DD MMM YY"), "demand": st.column_config.NumberColumn(format="%.0f"),
+                                    "robust_z": st.column_config.NumberColumn("Robust z", format="%.1f"), "score": st.column_config.ProgressColumn("Anomaly score", min_value=0.3, max_value=0.8, format="%.2f")})
+
+    st.markdown(ui.section("ML segmentation & AI service levels", "ABC (revenue) × XYZ (variability) + K-means demand clusters"), unsafe_allow_html=True)
+    c1, c2 = st.columns([1.3, 1], gap="medium")
+    with c1:
+        fig = px.scatter(SEG, x="mean_wk", y="cv", color="cluster_name", size="revenue", size_max=30, hover_name="sku",
+                         hover_data={"description": True, "segment": True, "ai_service": ":.0%"}, log_x=True,
+                         color_discrete_sequence=ui.colorway(T))
+        fig.add_hline(y=0.5, line=dict(color=T["muted"], dash="dot"), annotation_text="X | Y")
+        fig.add_hline(y=1.0, line=dict(color=T["muted"], dash="dot"), annotation_text="Y | Z")
+        fig.update_layout(title="K-means demand clusters (bubble = revenue)", xaxis_title="Mean weekly demand (log)", yaxis_title="Coefficient of variation",
+                          legend_title_text="")
+        fig_(fig, 400)
+    with c2:
+        mat = SEG.groupby(["ABC", "XYZ"]).size().unstack(fill_value=0).reindex(index=["A", "B", "C"], columns=["X", "Y", "Z"], fill_value=0)
+        txt_ = [[f"{mat.loc[a, x]} SKUs<br>α {A.SEG_SERVICE[a + x]:.0%}" for x in mat.columns] for a in mat.index]
+        fig = go.Figure(go.Heatmap(z=mat.values, x=["X · stable", "Y · variable", "Z · erratic"], y=["A · top 80% revenue", "B · next 15%", "C · last 5%"],
+                                   text=txt_, texttemplate="%{text}", colorscale=[[0, T["surface2"]], [1, T["primary"]]], showscale=False, xgap=4, ygap=4))
+        fig.update_yaxes(autorange="reversed")
+        fig.update_layout(title="Segment matrix → auto-assigned service level")
+        fig_(fig, 400, legend=False)
+
+    c1, c2 = st.columns([1.3, 1], gap="medium")
+    with c1:
+        with st.expander("📰 Today's AI exception digest", expanded=False):
+            st.markdown(dg)
+    with c2:
+        with st.expander("✏️ Edit scenario stock (on hand / on order / backorders)"):
+            ed = st.data_editor(P[["sku", "on_hand", "on_order", "backorders"]], hide_index=True, width="stretch", height=300,
+                                disabled=["sku"], key="stock_editor", column_config={c_: st.column_config.NumberColumn(min_value=0, step=1, format="%.0f") for c_ in ["on_hand", "on_order", "backorders"]})
+            if st.button("Apply stock changes", type="primary", width="stretch"):
+                ss.stock_edits = {r.sku: {"on_hand": float(r.on_hand), "on_order": float(r.on_order), "backorders": float(r.backorders)} for r in ed.itertuples()}
+                st.rerun()
+            st.caption("Stock on hand is a simulated scenario — the public dataset has no inventory records.")
+
+# ================================================================== TAB 3 · WORKSTREAM 1 · DEMAND FORECASTING
+with tabs[2]:
     st.markdown(ui.section(f"Demand forecasting · {FOCUS}", f"{FR['description']} — chronological train / validation / test with rolling-origin backtesting", "ML"), unsafe_allow_html=True)
     c = st.columns([1.1, 1, 1, 1, 1.4])
     freq = c[0].segmented_control("Granularity", ["D", "W", "M"], default="W", format_func=lambda f: D.FREQ_LABEL[f], key="fc_freq") or "W"
@@ -351,7 +557,7 @@ with tabs[1]:
     v, te = bt["validation"], bt["test"]
     naive_w = te.loc["Naive", "WAPE %"] if "Naive" in te.index else np.nan
     st.markdown(ui.kpi_row([
-        ui.kpi("Best model (validation)", f"<span style='font-size:1.05rem'>{best}</span>", f"WAPE {v.loc[best, 'WAPE %']:.1f}% across {folds} fold(s)", "★", T["primary"]),
+        ui.kpi("Best model (validation)", f"<span style='font-size:1.0rem;white-space:normal;display:block;line-height:1.25'>{best}</span>", f"WAPE {v.loc[best, 'WAPE %']:.1f}% across {folds} fold(s)", "★", T["primary"]),
         ui.kpi("Test WAPE · selected", f"{te.loc[sel_model, 'WAPE %']:.1f}%", (f"<span class='up'>{naive_w - te.loc[sel_model, 'WAPE %']:.1f} pp better</span> than naive" if np.isfinite(naive_w) and naive_w > te.loc[sel_model, 'WAPE %'] else "vs naive benchmark"), "◎", T["blue"]),
         ui.kpi("Test RMSE · selected", fmt(te.loc[sel_model, "RMSE"], 1), f"MAE {te.loc[sel_model, 'MAE']:,.1f} · bias {te.loc[sel_model, 'Bias']:+,.1f}", "σ", T["amber"], "units"),
         ui.kpi(f"Forecast · next {h} {D.FREQ_LABEL[freq].lower()[:-2] if freq != 'D' else 'day'}s", fmt(fc["forecast"].sum()), f"{level:.0%} PI per period ±{(fc['upper'] - fc['forecast']).mean():,.0f}", "↗", T["green"], "units"),
@@ -431,231 +637,232 @@ with tabs[1]:
 - **Continuous updating:** upload new observations in **Data Manager** → validation, reconciliation, re-training, backtesting and
   re-computation of safety stock, ROP and recommendations happen automatically on the next run (on-demand batch refresh).""")
 
-# ================================================================== TAB 3 · SAFETY STOCK & ROP
-with tabs[2]:
-    st.markdown(ui.section(f"Safety stock & reorder-point calculator · {FOCUS}", "Inputs pre-filled from the AI forecast / sidebar — override any value", "analytical"), unsafe_allow_html=True)
-
-    def ninput(col, label, default, key, step, fmt_="%.2f", mn=0.0, mx=None, help=None):
-        return col.number_input(label, min_value=mn, max_value=mx, value=float(round(default, 3)), step=step, format=fmt_,
-                                key=f"ssc_{key}_{FOCUS}_{round(float(default), 3)}", help=help)
-    c = st.columns(4)
-    d_bar = ninput(c[0], "Mean demand D̄ (units/week)", FR["d_bar"], "dbar", 1.0)
-    sd_d = ninput(c[1], "Demand σ_D (units/week)", FR["sd_d"], "sdd", 1.0)
-    L_d = ninput(c[2], "Mean lead time L (days)", ss.lt_days, "L", 1.0, "%.1f", 0.1)
-    sdL_d = ninput(c[3], "Lead-time σ_L (days)", ss.lt_sd_days, "sdL", 0.5, "%.1f")
-    c = st.columns(4)
-    svc_c = c[0].slider("Service level α", 0.80, 0.999, float(svc), 0.005, format="%.3f", key=f"ssc_svc_{svc}")
-    oh = ninput(c[1], "Current stock on hand", FR["on_hand"], "oh", 10.0, "%.0f", help="Simulated scenario value unless edited.")
-    oo = ninput(c[2], "On-order quantity", FR["on_order"], "oo", 10.0, "%.0f")
-    bo = ninput(c[3], "Backorders", FR["backorders"], "bo", 10.0, "%.0f")
-    Lw, sLw = L_d / 7, sdL_d / 7
-    comp = I.ss_components(svc_c, d_bar, sd_d, Lw, sLw)
-    ip = oh + oo - bo
-    risk = I.stockout_risk(ip, d_bar, sd_d, Lw, sLw)
-    status = I.classify(ip, comp["ss"], comp["rop"], comp["ltd_mean"])
-    q = max(1.0, I.eoq(d_bar * 52, ss.order_cost, FR["unit_cost"] * ss.holding_rate))
-    n_ord = np.floor((comp["rop"] - ip) / q) + 1 if ip <= comp["rop"] else 0
-    st.markdown(ui.kpi_row([
-        ui.kpi("Z factor", f"{comp['z']:.3f}", f"Φ⁻¹({svc_c:.3f})", "Z", T["blue"]),
-        ui.kpi("Expected LT demand", fmt(comp["ltd_mean"]), f"D̄·L = {d_bar:,.1f} × {Lw:.2f} wk", "∑", T["primary"], "units"),
-        ui.kpi("Safety stock", fmt(comp["ss"]), f"σ_LTD = {comp['sigma_ltd']:,.1f}", "⛨", T["primary"], "units"),
-        ui.kpi("Reorder point", fmt(comp["rop"]), f"{comp['rop'] / max(d_bar, 1e-9):.1f} weeks of demand", "◆", T["amber"], "units"),
-    ], 4) + ui.kpi_row([
-        ui.kpi("Inventory position", fmt(ip), "on hand + on order − backorders", "▣", T["blue"], "units"),
-        ui.kpi("Stockout risk now", f"{risk:.1%}", "P(LTD > position) · Normal approx.", "⚠", T["red"] if risk > 1 - svc_c else T["green"]),
-        ui.kpi("Status", f"<span style='font-size:1.05rem;color:{SC[status]}'>{status}</span>", f"EOQ = {q:,.0f} units", "⚑", SC[status]),
-        ui.kpi("Recommendation", f"<span style='font-size:1.05rem'>{'Order ' + fmt(n_ord * q) + ' u' if n_ord else 'Hold'}</span>",
-               (f"IP ≤ ROP → order {int(n_ord)}×EOQ" if n_ord else f"{ip - comp['rop']:,.0f} u above ROP"), "➜", T["green"]),
-    ], 4), unsafe_allow_html=True)
-
-    c1, c2 = st.columns([1, 1])
-    with c1:
-        st.markdown("#### Formula (from the assignment)")
-        st.latex(r"SS = Z\sqrt{\sigma_D^2\,L + \bar D^2\,\sigma_L^2}\qquad ROP = \bar D\,L + SS")
-        st.latex(rf"SS = {comp['z']:.3f}\sqrt{{{sd_d:,.1f}^2\times{Lw:.3f} + {d_bar:,.1f}^2\times{sLw:.3f}^2}} = \mathbf{{{comp['ss']:,.1f}}}")
-        st.latex(rf"ROP = {d_bar:,.1f}\times{Lw:.3f} + {comp['ss']:,.1f} = \mathbf{{{comp['rop']:,.1f}}}")
-        st.markdown(f"""<div style='font-size:.84rem;color:var(--muted)'>Units: demand per <b>week</b>, lead time converted
-        days → weeks (L = {L_d:.1f}/7 = {Lw:.3f} wk). Variance share: <b style='color:{T['primary']}'>{comp['share_demand']:.0%} demand</b> ·
-        <b style='color:{T['amber']}'>{comp['share_leadtime']:.0%} lead time</b>. Assumes i.i.d. weekly demand, lead time independent of
-        demand and approximately Normal lead-time demand — the Monte Carlo comparison below relaxes these.</div>""", unsafe_allow_html=True)
-    with c2:
-        sl = np.linspace(0.80, 0.999, 120)
-        fig = go.Figure()
-        fig.add_trace(go.Scatter(x=sl, y=[I.safety_stock(x, d_bar, sd_d, Lw, sLw) for x in sl], name="Safety stock",
-                                 line=dict(color=T["primary"], width=3), fill="tozeroy", fillcolor="rgba(45,212,191,0.10)"))
-        fig.add_trace(go.Scatter(x=[svc_c], y=[comp["ss"]], mode="markers+text", text=[f"  {svc_c:.1%} → {comp['ss']:,.0f}"],
-                                 textposition="middle right", marker=dict(size=13, color=T["amber"]), name="Current"))
-        fig.update_layout(title="Cost of service: safety stock vs service level", xaxis_tickformat=".0%")
-        fig_(fig, 330)
-
-    c1, c2 = st.columns(2)
-    with c1:
-        x = np.linspace(max(0, comp["ltd_mean"] - 4 * comp["sigma_ltd"]), comp["ltd_mean"] + 4.5 * comp["sigma_ltd"], 400)
-        pdf = norm.pdf(x, comp["ltd_mean"], comp["sigma_ltd"])
-        mc = run_mc(20000, "Gamma", d_bar, max(sd_d, 1e-6), "Gamma", Lw, max(sLw, 1e-6), 0.0, 11, None)
-        fig = go.Figure()
-        fig.add_trace(go.Histogram(x=mc["ltd"], histnorm="probability density", nbinsx=70, name="Monte Carlo (Gamma/Gamma)",
-                                   marker_color=T["blue"], opacity=0.35))
-        fig.add_trace(go.Scatter(x=x, y=pdf, name="Normal approximation", line=dict(color=T["primary"], width=2.5)))
-        xt = x[x >= comp["rop"]]
-        fig.add_trace(go.Scatter(x=np.r_[xt, xt[::-1]], y=np.r_[norm.pdf(xt, comp["ltd_mean"], comp["sigma_ltd"]), np.zeros(len(xt))],
-                                 fill="toself", fillcolor="rgba(248,113,113,0.35)", line=dict(width=0), name=f"Stockout zone ({1 - svc_c:.1%})"))
-        fig.add_vline(x=comp["rop"], line=dict(color=T["amber"], dash="dash"), annotation_text="ROP")
-        fig.add_vline(x=ip, line=dict(color=T["text"], dash="dot"), annotation_text="Position", annotation_position="bottom right")
-        fig.update_layout(title="Lead-time demand distribution", bargap=0.02)
-        fig_(fig, 360)
-    with c2:
-        mults = np.round(np.linspace(0.5, 2.0, 7), 2)
-        sls = np.linspace(0, max(2 * sdL_d, 6), 7)
-        Z = [[I.safety_stock(svc_c, d_bar, sd_d * m, Lw, s_ / 7) for m in mults] for s_ in sls]
-        fig = go.Figure(go.Heatmap(z=Z, x=[f"{m:.2f}×" for m in mults], y=[f"{s_:.1f} d" for s_ in sls], texttemplate="%{z:,.0f}",
-                                   colorscale=[[0, T["surface2"]], [0.5, T["blue"]], [1, T["red"]]], colorbar=dict(thickness=10),
-                                   hovertemplate="σ_D %{x} · σ_L %{y}<br>SS %{z:,.0f}<extra></extra>"))
-        fig.update_layout(title="How variability inflates the buffer", xaxis_title="Demand σ multiplier", yaxis_title="Lead-time σ (days)")
-        fig_(fig, 360, legend=False)
-
-    c1, c2 = st.columns([1, 1.1])
-    with c1:
-        base_ss = comp["ss"]
-        items = {"Demand σ_D": ("sd", sd_d), "Mean demand D̄": ("d", d_bar), "Lead time L": ("L", Lw), "Lead-time σ_L": ("sL", sLw)}
-        rows = []
-        for lab, (k, v) in items.items():
-            lo_hi = []
-            for f in (0.8, 1.2):
-                a = dict(d=d_bar, sd=sd_d, L=Lw, sL=sLw); a[k] = v * f
-                lo_hi.append(I.safety_stock(svc_c, a["d"], a["sd"], a["L"], a["sL"]) - base_ss)
-            rows.append((lab, *lo_hi))
-        rows.sort(key=lambda r: abs(r[2] - r[1]))
-        fig = go.Figure()
-        fig.add_trace(go.Bar(y=[r[0] for r in rows], x=[r[1] for r in rows], orientation="h", name="−20%", marker_color=T["blue"]))
-        fig.add_trace(go.Bar(y=[r[0] for r in rows], x=[r[2] for r in rows], orientation="h", name="+20%", marker_color=T["amber"]))
-        fig.update_layout(barmode="overlay", title="Tornado: Δ safety stock for ±20% input change")
-        fig_(fig, 320)
-    with c2:
-        st.markdown(ui.section("Analytical vs simulation", "20,000 draws each · same inputs", "MC"), unsafe_allow_html=True)
-        rows = [{"Method": "Analytical formula (Normal)", "E[LTD]": comp["ltd_mean"], "ROP": comp["rop"], "Safety stock": comp["ss"]}]
-        for lab, dd, ld, rho in [("MC · Normal demand, Normal LT", "Normal (truncated at 0)", "Normal (truncated)", 0.0),
-                                 ("MC · Gamma demand, Gamma LT", "Gamma", "Gamma", 0.0),
-                                 ("MC · Gamma, skewed LT (triangular)", "Gamma", "Triangular (right-skewed)", 0.0),
-                                 ("MC · joint: LT ↔ demand ρ = 0.5", "Gamma", "Gamma", 0.5)]:
-            r_ = run_mc(20000, dd, d_bar, max(sd_d, 1e-6), ld, Lw, max(sLw, 1e-6), rho, 21, None)["ltd"]
-            q_ = float(np.quantile(r_, svc_c))
-            rows.append({"Method": lab, "E[LTD]": r_.mean(), "ROP": q_, "Safety stock": q_ - r_.mean()})
-        cmp_ = pd.DataFrame(rows)
-        cmp_["Δ ROP vs formula"] = cmp_["ROP"] - comp["rop"]
-        ss["ssc_compare"] = cmp_
-        st.dataframe(cmp_.style.format({c: "{:,.1f}" for c in cmp_.columns if c != "Method"}), hide_index=True, width="stretch")
-        st.caption("Right-skewed or demand-correlated lead times push the true quantile above the Normal formula → the analytical SS under-protects; use the simulated buffer when independence/normality is doubtful.")
-
-# ================================================================== TAB 4 · MONTE CARLO
+# ================================================================== TAB 4 · WORKSTREAM 2 · SAFETY STOCK & MONTE CARLO
 with tabs[3]:
-    st.markdown(ui.section(f"Monte Carlo risk simulation · {FOCUS}", "Lead-time demand = Σ weekly demand over a random lead time · reproducible seed", "probabilistic"), unsafe_allow_html=True)
-    yw = D.series(ss.df, FOCUS, "W")
-    with st.form("mc_form"):
-        c = st.columns(4)
-        dd = c[0].selectbox("Demand distribution", S.DEMAND_DISTS, index=1, help="Gamma is non-negative and right-skewed — a natural fit for retail demand. Empirical bootstraps the observed weekly history.")
-        ld = c[1].selectbox("Lead-time distribution", S.LEAD_DISTS, index=1)
-        n_sim = c[2].select_slider("Simulations", [1000, 5000, 10000, 25000, 50000, 100000], 10000)
-        seed = c[3].number_input("Random seed", 0, 99999, 42)
-        c = st.columns(4)
-        dm = c[0].number_input("Mean demand (units/wk)", 0.0, value=float(round(FR["d_bar"], 1)), step=1.0)
-        dsd = c[1].number_input("Demand σ (units/wk)", 0.0, value=float(round(FR["sd_d"], 1)), step=1.0)
-        lm = c[2].number_input("Mean lead time (days)", 0.5, value=float(ss.lt_days), step=1.0)
-        lsd = c[3].number_input("Lead-time σ (days)", 0.0, value=float(ss.lt_sd_days), step=0.5)
-        c = st.columns(4)
-        msvc = c[0].slider("Service target α", 0.80, 0.999, float(svc), 0.005, format="%.3f")
-        rho = c[1].slider("Lead time ↔ demand correlation ρ", 0.0, 0.9, 0.0, 0.05, help="Joint simulation (Gaussian copula). ρ>0: busy periods coincide with slower suppliers — violates the formula's independence assumption.")
-        spike = c[2].slider("Stress: demand spike", 0.0, 1.0, 0.30, 0.05, format="%.2f")
-        delay = c[3].slider("Stress: supplier delay", 0.0, 1.5, 0.50, 0.05, format="%.2f")
-        test_rop = st.slider("Reorder point to evaluate (units)", 0.0, float(max(10.0, FR["rop"] * 2.5)), float(round(FR["rop"])), 1.0)
-        go_ = st.form_submit_button("▶ Run Monte Carlo simulation", type="primary", width="stretch")
-    params = (n_sim, dd, dm, max(dsd, 1e-6), ld, lm / 7, max(lsd / 7, 1e-6), rho, int(seed))
-    if go_ or ss.get("mc_params") is None or ss.get("mc_sku") != FOCUS:
-        ss.mc_params, ss.mc_sku = params, FOCUS
-        ss.mc_run_at = datetime.now().strftime("%H:%M:%S")
-    n_sim, dd, dm, dsd, ld, lmw, lsdw, rho, seed = ss.mc_params
-    emp = tuple(yw.tail(104).values) if dd.startswith("Empirical") else None
-    with st.spinner(f"Simulating {n_sim:,} lead-time cycles…"):
-        mc = run_mc(n_sim, dd, dm, dsd, ld, lmw, lsdw, rho, seed, emp)
-    q_eoq = float(FR["eoq"])
-    summ = S.summarize(mc["ltd"].values, msvc, test_rop, q_eoq)
-    an = I.ss_components(msvc, dm, dsd, lmw, lsdw)
-    st.markdown(ui.kpi_row([
-        ui.kpi("Stockout probability", f"{summ['stockout_prob']:.2%}", f"at ROP {test_rop:,.0f} · per cycle (1 − α)", "⚠", T["red"] if summ["stockout_prob"] > 1 - msvc else T["green"]),
-        ui.kpi("Cycle service level α", f"{summ['cycle_service']:.2%}", f"target {msvc:.1%}", "✓", T["green"]),
-        ui.kpi("Fill rate β", f"{summ['fill_rate']:.2%}", f"units served / demanded · Q = EOQ {q_eoq:,.0f}", "◐", T["blue"]),
-        ui.kpi("Expected shortage", fmt(summ["expected_shortage"], 1), "units short per replenishment cycle", "↯", T["orange"], "units"),
-    ]) + ui.kpi_row([
-        ui.kpi("Required buffer (MC)", fmt(summ["ss_sim"]), f"Analytical SS {an['ss']:,.0f} · Δ {summ['ss_sim'] - an['ss']:+,.0f}", "⛨", T["primary"], "units"),
-        ui.kpi("Required ROP (MC)", fmt(summ["rop_sim"]), f"{msvc:.1%} quantile of LTD", "◆", T["amber"], "units"),
-        ui.kpi("Mean / σ lead-time demand", f"{summ['mean_ltd']:,.0f}", f"σ {summ['sd_ltd']:,.0f} · skew {summ['skew']:.2f}", "∑", T["blue"], "units"),
-        ui.kpi("P95 / P99 lead-time demand", f"{summ['p95_ltd']:,.0f}", f"P99 {summ['p99_ltd']:,.0f}", "▲", T["red"], "units"),
-    ]), unsafe_allow_html=True)
-    st.caption(f"Run at {ss.get('mc_run_at')} · seed **{seed}** · n = **{n_sim:,}** · demand **{dd}** (μ={dm:,.1f}, σ={dsd:,.1f}/wk) · lead time **{ld}** (μ={lmw * 7:.1f}, σ={lsdw * 7:.1f} days) · ρ = {rho:.2f}. "
-               "α (cycle service) = P(no stockout in a cycle); β (fill rate) = share of demand met from stock — they are different metrics.")
+    w2 = st.segmented_control("Workstream 2 view", ["Analytical safety stock & ROP", "Monte Carlo risk simulation"],
+                              default="Analytical safety stock & ROP", key="w2_view", label_visibility="collapsed") or "Analytical safety stock & ROP"
+    if w2.startswith("Analytical"):
+        st.markdown(ui.section(f"Safety stock & reorder-point calculator · {FOCUS}", "Inputs pre-filled from the AI forecast / sidebar — override any value", "analytical"), unsafe_allow_html=True)
 
-    c1, c2 = st.columns(2)
-    with c1:
-        fig = go.Figure()
-        fig.add_trace(go.Histogram(x=mc["ltd"], nbinsx=80, histnorm="probability", marker_color=T["blue"], opacity=0.8, name="Simulated LTD"))
-        for xv, lab, col in [(summ["mean_ltd"], "Mean", T["muted"]), (an["rop"], "ROP formula", T["primary"]),
-                             (summ["rop_sim"], "ROP MC", T["amber"]), (test_rop, "Evaluated ROP", T["red"])]:
-            fig.add_vline(x=xv, line=dict(color=col, dash="dash", width=2), annotation_text=lab, annotation_font_color=col)
-        fig.update_layout(title="Lead-time demand probability histogram", bargap=0.03)
-        fig_(fig, 360, legend=False)
-    with c2:
-        xs = np.sort(mc["ltd"].values)
-        cdf = np.arange(1, len(xs) + 1) / len(xs)
-        step = max(1, len(xs) // 1500)
-        fig = go.Figure(go.Scatter(x=xs[::step], y=cdf[::step], line=dict(color=T["primary"], width=3), name="Empirical CDF",
-                                   fill="tozeroy", fillcolor="rgba(45,212,191,0.08)"))
-        fig.add_hline(y=msvc, line=dict(color=T["amber"], dash="dot"), annotation_text=f"α = {msvc:.1%}")
-        fig.add_vline(x=summ["rop_sim"], line=dict(color=T["amber"], dash="dot"))
-        fig.update_layout(title="Cumulative probability: service achieved by stocking level", yaxis_tickformat=".0%", xaxis_title="Units available during lead time")
-        fig_(fig, 360, legend=False)
+        def ninput(col, label, default, key, step, fmt_="%.2f", mn=0.0, mx=None, help=None):
+            return col.number_input(label, min_value=mn, max_value=mx, value=float(round(default, 3)), step=step, format=fmt_,
+                                    key=f"ssc_{key}_{FOCUS}_{round(float(default), 3)}", help=help)
+        c = st.columns(4)
+        d_bar = ninput(c[0], "Mean demand D̄ (units/week)", FR["d_bar"], "dbar", 1.0)
+        sd_d = ninput(c[1], "Demand σ_D (units/week)", FR["sd_d"], "sdd", 1.0)
+        L_d = ninput(c[2], "Mean lead time L (days)", ss.lt_days, "L", 1.0, "%.1f", 0.1)
+        sdL_d = ninput(c[3], "Lead-time σ_L (days)", ss.lt_sd_days, "sdL", 0.5, "%.1f")
+        c = st.columns(4)
+        svc_c = c[0].slider("Service level α", 0.80, 0.999, float(svc), 0.005, format="%.3f", key=f"ssc_svc_{svc}")
+        oh = ninput(c[1], "Current stock on hand", FR["on_hand"], "oh", 10.0, "%.0f", help="Simulated scenario value unless edited.")
+        oo = ninput(c[2], "On-order quantity", FR["on_order"], "oo", 10.0, "%.0f")
+        bo = ninput(c[3], "Backorders", FR["backorders"], "bo", 10.0, "%.0f")
+        Lw, sLw = L_d / 7, sdL_d / 7
+        comp = I.ss_components(svc_c, d_bar, sd_d, Lw, sLw)
+        ip = oh + oo - bo
+        risk = I.stockout_risk(ip, d_bar, sd_d, Lw, sLw)
+        status = I.classify(ip, comp["ss"], comp["rop"], comp["ltd_mean"])
+        q = max(1.0, I.eoq(d_bar * 52, ss.order_cost, FR["unit_cost"] * ss.holding_rate))
+        n_ord = np.floor((comp["rop"] - ip) / q) + 1 if ip <= comp["rop"] else 0
+        st.markdown(ui.kpi_row([
+            ui.kpi("Z factor", f"{comp['z']:.3f}", f"Φ⁻¹({svc_c:.3f})", "Z", T["blue"]),
+            ui.kpi("Expected LT demand", fmt(comp["ltd_mean"]), f"D̄·L = {d_bar:,.1f} × {Lw:.2f} wk", "∑", T["primary"], "units"),
+            ui.kpi("Safety stock", fmt(comp["ss"]), f"σ_LTD = {comp['sigma_ltd']:,.1f}", "⛨", T["primary"], "units"),
+            ui.kpi("Reorder point", fmt(comp["rop"]), f"{comp['rop'] / max(d_bar, 1e-9):.1f} weeks of demand", "◆", T["amber"], "units"),
+        ], 4) + ui.kpi_row([
+            ui.kpi("Inventory position", fmt(ip), "on hand + on order − backorders", "▣", T["blue"], "units"),
+            ui.kpi("Stockout risk now", f"{risk:.1%}", "P(LTD > position) · Normal approx.", "⚠", T["red"] if risk > 1 - svc_c else T["green"]),
+            ui.kpi("Status", f"<span style='font-size:1.0rem;color:{SC[status]};white-space:normal;display:block;line-height:1.25'>{status}</span>", f"EOQ = {q:,.0f} units", "⚑", SC[status]),
+            ui.kpi("Recommendation", f"<span style='font-size:1.0rem;white-space:normal;display:block;line-height:1.25'>{'Order ' + fmt(n_ord * q) + ' u' if n_ord else 'Hold'}</span>",
+                   (f"IP ≤ ROP → order {int(n_ord)}×EOQ" if n_ord else f"{ip - comp['rop']:,.0f} u above ROP"), "➜", T["green"]),
+        ], 4), unsafe_allow_html=True)
 
-    c1, c2 = st.columns([1, 1.2])
-    with c1:
-        smp = mc.sample(min(3000, len(mc)), random_state=1)
-        fig = go.Figure(go.Scattergl(x=smp["lead_time"] * 7, y=smp["ltd"], mode="markers",
-                                     marker=dict(size=4, color=smp["ltd"] > test_rop, colorscale=[[0, T["blue"]], [1, T["red"]]], opacity=0.55)))
-        fig.add_hline(y=test_rop, line=dict(color=T["amber"], dash="dash"), annotation_text="ROP")
-        fig.update_layout(title="Joint risk: lead time vs lead-time demand (red = stockout)", xaxis_title="Lead time (days)", yaxis_title="LTD (units)")
-        fig_(fig, 380, legend=False)
-    with c2:
-        scen = S.scenario_set(dm, dsd, lmw, lsdw, spike, delay)
-        rows, dists = [], {}
-        for i, (nm, (a, b, c_, d_)) in enumerate(scen.items()):
-            r_ = run_mc(min(n_sim, 25000), dd if not dd.startswith("Empirical") else "Gamma", a, max(b, 1e-6), ld, c_, max(d_, 1e-6), rho, seed + i, None)["ltd"].values
-            sm = S.summarize(r_, msvc, test_rop, q_eoq)
-            rows.append({"Scenario": nm, "Mean LTD": sm["mean_ltd"], "Required SS": sm["ss_sim"], "Required ROP": sm["rop_sim"],
-                         "P(stockout) @ current ROP": sm["stockout_prob"], "Fill rate β": sm["fill_rate"], "Exp. shortage": sm["expected_shortage"]})
-            dists[nm] = r_
-        sc = pd.DataFrame(rows)
-        ss["mc_scenarios"] = sc
-        fig = go.Figure()
-        cols_ = [T["primary"], T["amber"], T["orange"], T["blue"], T["red"]]
-        for (nm, r_), col in zip(dists.items(), cols_):
-            fig.add_trace(go.Violin(y=r_[:4000], name=nm.split(" (")[0], line_color=col, fillcolor=col, opacity=0.55, box_visible=True, meanline_visible=True, points=False))
-        fig.add_hline(y=test_rop, line=dict(color=T["text"], dash="dot"), annotation_text="current ROP")
-        fig.update_layout(title="Risk scenarios: lead-time demand distributions", yaxis_title="Units")
-        fig_(fig, 380, legend=False)
-    st.markdown(ui.section("Scenario comparison", "Buffer required to keep α at target under each stress", "scenarios"), unsafe_allow_html=True)
-    st.dataframe(sc, hide_index=True, width="stretch", column_config={
-        "Mean LTD": st.column_config.NumberColumn(format="%.0f"), "Required SS": st.column_config.NumberColumn(format="%.0f"),
-        "Required ROP": st.column_config.NumberColumn(format="%.0f"),
-        "P(stockout) @ current ROP": st.column_config.ProgressColumn(min_value=0, max_value=1, format="percent"),
-        "Fill rate β": st.column_config.NumberColumn(format="percent"), "Exp. shortage": st.column_config.NumberColumn(format="%.1f")})
-    st.download_button("⬇ Download simulation draws (CSV)", mc.to_csv(index=False).encode(), f"montecarlo_{FOCUS}_seed{seed}.csv", "text/csv")
+        c1, c2 = st.columns([1, 1])
+        with c1:
+            st.markdown("<div class='chart-title'>Formula (from the assignment)</div>", unsafe_allow_html=True)
+            st.latex(r"SS = Z\sqrt{\sigma_D^2\,L + \bar D^2\,\sigma_L^2}\qquad ROP = \bar D\,L + SS")
+            st.latex(rf"SS = {comp['z']:.3f}\sqrt{{{sd_d:,.1f}^2\times{Lw:.3f} + {d_bar:,.1f}^2\times{sLw:.3f}^2}} = \mathbf{{{comp['ss']:,.1f}}}")
+            st.latex(rf"ROP = {d_bar:,.1f}\times{Lw:.3f} + {comp['ss']:,.1f} = \mathbf{{{comp['rop']:,.1f}}}")
+            st.markdown(f"""<div style='font-size:.84rem;color:var(--muted)'>Units: demand per <b>week</b>, lead time converted
+            days → weeks (L = {L_d:.1f}/7 = {Lw:.3f} wk). Variance share: <b style='color:{T['primary']}'>{comp['share_demand']:.0%} demand</b> ·
+            <b style='color:{T['amber']}'>{comp['share_leadtime']:.0%} lead time</b>. Assumes i.i.d. weekly demand, lead time independent of
+            demand and approximately Normal lead-time demand — the Monte Carlo comparison below relaxes these.</div>""", unsafe_allow_html=True)
+        with c2:
+            sl = np.linspace(0.80, 0.999, 120)
+            fig = go.Figure()
+            fig.add_trace(go.Scatter(x=sl, y=[I.safety_stock(x, d_bar, sd_d, Lw, sLw) for x in sl], name="Safety stock",
+                                     line=dict(color=T["primary"], width=3), fill="tozeroy", fillcolor="rgba(45,212,191,0.10)"))
+            fig.add_trace(go.Scatter(x=[svc_c], y=[comp["ss"]], mode="markers+text", text=[f"  {svc_c:.1%} → {comp['ss']:,.0f}"],
+                                     textposition="middle right", marker=dict(size=13, color=T["amber"]), name="Current"))
+            fig.update_layout(title="Cost of service: safety stock vs service level", xaxis_tickformat=".0%")
+            fig_(fig, 330)
 
-# ================================================================== TAB 5 · BAYESIAN OPTIMIZATION
+        c1, c2 = st.columns(2)
+        with c1:
+            x = np.linspace(max(0, comp["ltd_mean"] - 4 * comp["sigma_ltd"]), comp["ltd_mean"] + 4.5 * comp["sigma_ltd"], 400)
+            pdf = norm.pdf(x, comp["ltd_mean"], comp["sigma_ltd"])
+            mc = run_mc(20000, "Gamma", d_bar, max(sd_d, 1e-6), "Gamma", Lw, max(sLw, 1e-6), 0.0, 11, None)
+            fig = go.Figure()
+            fig.add_trace(go.Histogram(x=mc["ltd"], histnorm="probability density", nbinsx=70, name="Monte Carlo (Gamma/Gamma)",
+                                       marker_color=T["blue"], opacity=0.35))
+            fig.add_trace(go.Scatter(x=x, y=pdf, name="Normal approximation", line=dict(color=T["primary"], width=2.5)))
+            xt = x[x >= comp["rop"]]
+            fig.add_trace(go.Scatter(x=np.r_[xt, xt[::-1]], y=np.r_[norm.pdf(xt, comp["ltd_mean"], comp["sigma_ltd"]), np.zeros(len(xt))],
+                                     fill="toself", fillcolor="rgba(248,113,113,0.35)", line=dict(width=0), name=f"Stockout zone ({1 - svc_c:.1%})"))
+            fig.add_vline(x=comp["rop"], line=dict(color=T["amber"], dash="dash"), annotation_text="ROP")
+            fig.add_vline(x=ip, line=dict(color=T["text"], dash="dot"), annotation_text="Position", annotation_position="bottom right")
+            fig.update_layout(title="Lead-time demand distribution", bargap=0.02)
+            fig_(fig, 360)
+        with c2:
+            mults = np.round(np.linspace(0.5, 2.0, 7), 2)
+            sls = np.linspace(0, max(2 * sdL_d, 6), 7)
+            Z = [[I.safety_stock(svc_c, d_bar, sd_d * m, Lw, s_ / 7) for m in mults] for s_ in sls]
+            fig = go.Figure(go.Heatmap(z=Z, x=[f"{m:.2f}×" for m in mults], y=[f"{s_:.1f} d" for s_ in sls], texttemplate="%{z:,.0f}",
+                                       colorscale=[[0, T["surface2"]], [0.5, T["blue"]], [1, T["red"]]], colorbar=dict(thickness=10),
+                                       hovertemplate="σ_D %{x} · σ_L %{y}<br>SS %{z:,.0f}<extra></extra>"))
+            fig.update_layout(title="How variability inflates the buffer", xaxis_title="Demand σ multiplier", yaxis_title="Lead-time σ (days)")
+            fig_(fig, 360, legend=False)
+
+        c1, c2 = st.columns([1, 1.1])
+        with c1:
+            base_ss = comp["ss"]
+            items = {"Demand σ_D": ("sd", sd_d), "Mean demand D̄": ("d", d_bar), "Lead time L": ("L", Lw), "Lead-time σ_L": ("sL", sLw)}
+            rows = []
+            for lab, (k, v) in items.items():
+                lo_hi = []
+                for f in (0.8, 1.2):
+                    a = dict(d=d_bar, sd=sd_d, L=Lw, sL=sLw); a[k] = v * f
+                    lo_hi.append(I.safety_stock(svc_c, a["d"], a["sd"], a["L"], a["sL"]) - base_ss)
+                rows.append((lab, *lo_hi))
+            rows.sort(key=lambda r: abs(r[2] - r[1]))
+            fig = go.Figure()
+            fig.add_trace(go.Bar(y=[r[0] for r in rows], x=[r[1] for r in rows], orientation="h", name="−20%", marker_color=T["blue"]))
+            fig.add_trace(go.Bar(y=[r[0] for r in rows], x=[r[2] for r in rows], orientation="h", name="+20%", marker_color=T["amber"]))
+            fig.update_layout(barmode="overlay", title="Tornado: Δ safety stock for ±20% input change")
+            fig_(fig, 320)
+        with c2:
+            st.markdown(ui.section("Analytical vs simulation", "20,000 draws each · same inputs", "MC"), unsafe_allow_html=True)
+            rows = [{"Method": "Analytical formula (Normal)", "E[LTD]": comp["ltd_mean"], "ROP": comp["rop"], "Safety stock": comp["ss"]}]
+            for lab, dd, ld, rho in [("MC · Normal demand, Normal LT", "Normal (truncated at 0)", "Normal (truncated)", 0.0),
+                                     ("MC · Gamma demand, Gamma LT", "Gamma", "Gamma", 0.0),
+                                     ("MC · Gamma, skewed LT (triangular)", "Gamma", "Triangular (right-skewed)", 0.0),
+                                     ("MC · joint: LT ↔ demand ρ = 0.5", "Gamma", "Gamma", 0.5)]:
+                r_ = run_mc(20000, dd, d_bar, max(sd_d, 1e-6), ld, Lw, max(sLw, 1e-6), rho, 21, None)["ltd"]
+                q_ = float(np.quantile(r_, svc_c))
+                rows.append({"Method": lab, "E[LTD]": r_.mean(), "ROP": q_, "Safety stock": q_ - r_.mean()})
+            cmp_ = pd.DataFrame(rows)
+            cmp_["Δ ROP vs formula"] = cmp_["ROP"] - comp["rop"]
+            ss["ssc_compare"] = cmp_
+            st.dataframe(cmp_.style.format({c: "{:,.1f}" for c in cmp_.columns if c != "Method"}), hide_index=True, width="stretch")
+            st.caption("Right-skewed or demand-correlated lead times push the true quantile above the Normal formula → the analytical SS under-protects; use the simulated buffer when independence/normality is doubtful.")
+    else:
+        st.markdown(ui.section(f"Monte Carlo risk simulation · {FOCUS}", "Lead-time demand = Σ weekly demand over a random lead time · reproducible seed", "probabilistic"), unsafe_allow_html=True)
+        yw = D.series(ss.df, FOCUS, "W")
+        with st.form("mc_form"):
+            c = st.columns(4)
+            dd = c[0].selectbox("Demand distribution", S.DEMAND_DISTS, index=1, help="Gamma is non-negative and right-skewed — a natural fit for retail demand. Empirical bootstraps the observed weekly history.")
+            ld = c[1].selectbox("Lead-time distribution", S.LEAD_DISTS, index=1)
+            n_sim = c[2].select_slider("Simulations", [1000, 5000, 10000, 25000, 50000, 100000], 10000)
+            seed = c[3].number_input("Random seed", 0, 99999, 42)
+            c = st.columns(4)
+            dm = c[0].number_input("Mean demand (units/wk)", 0.0, value=float(round(FR["d_bar"], 1)), step=1.0)
+            dsd = c[1].number_input("Demand σ (units/wk)", 0.0, value=float(round(FR["sd_d"], 1)), step=1.0)
+            lm = c[2].number_input("Mean lead time (days)", 0.5, value=float(ss.lt_days), step=1.0)
+            lsd = c[3].number_input("Lead-time σ (days)", 0.0, value=float(ss.lt_sd_days), step=0.5)
+            c = st.columns(4)
+            msvc = c[0].slider("Service target α", 0.80, 0.999, float(svc), 0.005, format="%.3f")
+            rho = c[1].slider("Lead time ↔ demand correlation ρ", 0.0, 0.9, 0.0, 0.05, help="Joint simulation (Gaussian copula). ρ>0: busy periods coincide with slower suppliers — violates the formula's independence assumption.")
+            spike = c[2].slider("Stress: demand spike", 0.0, 1.0, 0.30, 0.05, format="%.2f")
+            delay = c[3].slider("Stress: supplier delay", 0.0, 1.5, 0.50, 0.05, format="%.2f")
+            test_rop = st.slider("Reorder point to evaluate (units)", 0.0, float(max(10.0, FR["rop"] * 2.5)), float(round(FR["rop"])), 1.0)
+            go_ = st.form_submit_button("▶ Run Monte Carlo simulation", type="primary", width="stretch")
+        params = (n_sim, dd, dm, max(dsd, 1e-6), ld, lm / 7, max(lsd / 7, 1e-6), rho, int(seed))
+        if go_ or ss.get("mc_params") is None or ss.get("mc_sku") != FOCUS:
+            ss.mc_params, ss.mc_sku = params, FOCUS
+            ss.mc_run_at = datetime.now().strftime("%H:%M:%S")
+        n_sim, dd, dm, dsd, ld, lmw, lsdw, rho, seed = ss.mc_params
+        emp = tuple(yw.tail(104).values) if dd.startswith("Empirical") else None
+        with st.spinner(f"Simulating {n_sim:,} lead-time cycles…"):
+            mc = run_mc(n_sim, dd, dm, dsd, ld, lmw, lsdw, rho, seed, emp)
+        q_eoq = float(FR["eoq"])
+        summ = S.summarize(mc["ltd"].values, msvc, test_rop, q_eoq)
+        an = I.ss_components(msvc, dm, dsd, lmw, lsdw)
+        st.markdown(ui.kpi_row([
+            ui.kpi("Stockout probability", f"{summ['stockout_prob']:.2%}", f"at ROP {test_rop:,.0f} · per cycle (1 − α)", "⚠", T["red"] if summ["stockout_prob"] > 1 - msvc else T["green"]),
+            ui.kpi("Cycle service level α", f"{summ['cycle_service']:.2%}", f"target {msvc:.1%}", "✓", T["green"]),
+            ui.kpi("Fill rate β", f"{summ['fill_rate']:.2%}", f"units served / demanded · Q = EOQ {q_eoq:,.0f}", "◐", T["blue"]),
+            ui.kpi("Expected shortage", fmt(summ["expected_shortage"], 1), "units short per replenishment cycle", "↯", T["orange"], "units"),
+        ]) + ui.kpi_row([
+            ui.kpi("Required buffer (MC)", fmt(summ["ss_sim"]), f"Analytical SS {an['ss']:,.0f} · Δ {summ['ss_sim'] - an['ss']:+,.0f}", "⛨", T["primary"], "units"),
+            ui.kpi("Required ROP (MC)", fmt(summ["rop_sim"]), f"{msvc:.1%} quantile of LTD", "◆", T["amber"], "units"),
+            ui.kpi("Mean LT demand", f"{summ['mean_ltd']:,.0f}", f"σ {summ['sd_ltd']:,.0f} · skew {summ['skew']:.2f}", "∑", T["blue"], "units"),
+            ui.kpi("P95 / P99 LT demand", f"{summ['p95_ltd']:,.0f}", f"P99 {summ['p99_ltd']:,.0f}", "▲", T["red"], "units"),
+        ]), unsafe_allow_html=True)
+        st.caption(f"Run at {ss.get('mc_run_at')} · seed **{seed}** · n = **{n_sim:,}** · demand **{dd}** (μ={dm:,.1f}, σ={dsd:,.1f}/wk) · lead time **{ld}** (μ={lmw * 7:.1f}, σ={lsdw * 7:.1f} days) · ρ = {rho:.2f}. "
+                   "α (cycle service) = P(no stockout in a cycle); β (fill rate) = share of demand met from stock — they are different metrics.")
+
+        c1, c2 = st.columns(2)
+        with c1:
+            fig = go.Figure()
+            fig.add_trace(go.Histogram(x=mc["ltd"], nbinsx=80, histnorm="probability", marker_color=T["blue"], opacity=0.8, name="Simulated LTD"))
+            for xv, lab, col in [(summ["mean_ltd"], "Mean", T["muted"]), (an["rop"], "ROP formula", T["primary"]),
+                                 (summ["rop_sim"], "ROP MC", T["amber"]), (test_rop, "Evaluated ROP", T["red"])]:
+                fig.add_vline(x=xv, line=dict(color=col, dash="dash", width=2), annotation_text=lab, annotation_font_color=col)
+            fig.update_layout(title="Lead-time demand probability histogram", bargap=0.03)
+            fig_(fig, 360, legend=False)
+        with c2:
+            xs = np.sort(mc["ltd"].values)
+            cdf = np.arange(1, len(xs) + 1) / len(xs)
+            step = max(1, len(xs) // 1500)
+            fig = go.Figure(go.Scatter(x=xs[::step], y=cdf[::step], line=dict(color=T["primary"], width=3), name="Empirical CDF",
+                                       fill="tozeroy", fillcolor="rgba(45,212,191,0.08)"))
+            fig.add_hline(y=msvc, line=dict(color=T["amber"], dash="dot"), annotation_text=f"α = {msvc:.1%}")
+            fig.add_vline(x=summ["rop_sim"], line=dict(color=T["amber"], dash="dot"))
+            fig.update_layout(title="Cumulative probability: service achieved by stocking level", yaxis_tickformat=".0%", xaxis_title="Units available during lead time")
+            fig_(fig, 360, legend=False)
+
+        c1, c2 = st.columns([1, 1.2])
+        with c1:
+            smp = mc.sample(min(3000, len(mc)), random_state=1)
+            fig = go.Figure(go.Scattergl(x=smp["lead_time"] * 7, y=smp["ltd"], mode="markers",
+                                         marker=dict(size=4, color=smp["ltd"] > test_rop, colorscale=[[0, T["blue"]], [1, T["red"]]], opacity=0.55)))
+            fig.add_hline(y=test_rop, line=dict(color=T["amber"], dash="dash"), annotation_text="ROP")
+            fig.update_layout(title="Joint risk: lead time vs lead-time demand (red = stockout)", xaxis_title="Lead time (days)", yaxis_title="LTD (units)")
+            fig_(fig, 380, legend=False)
+        with c2:
+            scen = S.scenario_set(dm, dsd, lmw, lsdw, spike, delay)
+            rows, dists = [], {}
+            for i, (nm, (a, b, c_, d_)) in enumerate(scen.items()):
+                r_ = run_mc(min(n_sim, 25000), dd if not dd.startswith("Empirical") else "Gamma", a, max(b, 1e-6), ld, c_, max(d_, 1e-6), rho, seed + i, None)["ltd"].values
+                sm = S.summarize(r_, msvc, test_rop, q_eoq)
+                rows.append({"Scenario": nm, "Mean LTD": sm["mean_ltd"], "Required SS": sm["ss_sim"], "Required ROP": sm["rop_sim"],
+                             "P(stockout) @ current ROP": sm["stockout_prob"], "Fill rate β": sm["fill_rate"], "Exp. shortage": sm["expected_shortage"]})
+                dists[nm] = r_
+            sc = pd.DataFrame(rows)
+            ss["mc_scenarios"] = sc
+            fig = go.Figure()
+            cols_ = [T["primary"], T["amber"], T["orange"], T["blue"], T["red"]]
+            for (nm, r_), col in zip(dists.items(), cols_):
+                fig.add_trace(go.Violin(y=r_[:4000], name=nm.split(" (")[0], line_color=col, fillcolor=col, opacity=0.55, box_visible=True, meanline_visible=True, points=False))
+            fig.add_hline(y=test_rop, line=dict(color=T["text"], dash="dot"), annotation_text="current ROP")
+            fig.update_layout(title="Risk scenarios: lead-time demand distributions", yaxis_title="Units")
+            fig_(fig, 380, legend=False)
+        st.markdown(ui.section("Scenario comparison", "Buffer required to keep α at target under each stress", "scenarios"), unsafe_allow_html=True)
+        st.dataframe(sc, hide_index=True, width="stretch", column_config={
+            "Mean LTD": st.column_config.NumberColumn(format="%.0f"), "Required SS": st.column_config.NumberColumn(format="%.0f"),
+            "Required ROP": st.column_config.NumberColumn(format="%.0f"),
+            "P(stockout) @ current ROP": st.column_config.ProgressColumn(min_value=0, max_value=1, format="percent"),
+            "Fill rate β": st.column_config.NumberColumn(format="percent"), "Exp. shortage": st.column_config.NumberColumn(format="%.1f")})
+        st.download_button("⬇ Download simulation draws (CSV)", mc.to_csv(index=False).encode(), f"montecarlo_{FOCUS}_seed{seed}.csv", "text/csv")
+
+# ================================================================== TAB 5 · WORKSTREAM 3 · BAYESIAN OPTIMIZATION
 with tabs[4]:
     st.markdown(ui.section(f"Bayesian optimisation lab · {FOCUS}", "Replaces manual parameter sweeps — a surrogate model decides where to evaluate next", "AI"), unsafe_allow_html=True)
     price = float(FR["price"]); ucost = float(FR["unit_cost"])
     rop0, eoq0 = float(FR["rop"]), float(FR["eoq"])
     c1, c2 = st.columns([1.15, 1])
     with c1:
-        st.markdown("#### Objective & constraints")
+        st.markdown("<div class='chart-title'>Objective & constraints</div>", unsafe_allow_html=True)
         st.latex(r"\min_{s,\,Q}\; \mathbb{E}[C] = \underbrace{K\,\tfrac{N_{orders}}{yr}}_{ordering} + \underbrace{h\,c\,\bar I}_{holding} + \underbrace{p\,\mathbb{E}[\text{units short}]}_{shortage}")
         st.latex(r"\text{s.t. } \beta \ge \beta^{*},\;\; I^{peak}_{95\%} \le \text{Cap},\;\; c\,\bar I \le \text{Budget},\;\; Q \ge \text{MOQ}")
         st.markdown(f"""<div style='font-size:.83rem;color:var(--muted)'>Continuous-review <b>(s, Q)</b> policy simulated <b>day by day</b>
@@ -692,7 +899,8 @@ with tabs[4]:
             res = O.tpe_bayes_opt(sim, cp, bounds, n_trials=n_trials, seed=int(bseed), penalty_scale=base_res["total_cost"], progress=cb)
         prog.empty()
         val = O.PolicySimulator(FR["d_bar"], FR["sd_d"], L_wk, max(sdL_wk, 1e-3), "Gamma", reps=max(reps, 300), seed=int(bseed) + 7919)
-        ss.bo = {"res": res, "base": base_res, "val_best": val.run(res["best"]["s"], res["best"]["Q"], cp),
+        ss.bo = {"sim_args": (FR["d_bar"], FR["sd_d"], L_wk, max(sdL_wk, 1e-3), "Gamma"), "sim_kw": {"reps": reps, "seed": int(bseed)},
+                 "bounds": bounds, "res": res, "base": base_res, "val_best": val.run(res["best"]["s"], res["best"]["Q"], cp),
                  "val_base": val.run(rop0, base_q, cp), "sku": FOCUS, "cp": cp, "at": datetime.now().strftime("%H:%M:%S"),
                  "ltd_mean": float(FR["ltd_mean"]), "method": method}
     bo = ss.get("bo")
@@ -705,7 +913,7 @@ with tabs[4]:
         st.markdown(ui.kpi_row([
             ui.kpi("Optimal reorder point s*", fmt(bst["s"]), f"baseline {b0['s']:,.0f}", "◆", T["primary"], "units"),
             ui.kpi("Implied safety stock", fmt(bst["s"] - bo["ltd_mean"]), f"s* − E[LTD] ({bo['ltd_mean']:,.0f})", "⛨", T["blue"], "units"),
-            ui.kpi("Optimal order quantity Q*", fmt(bst["Q"]), f"baseline EOQ {b0['Q']:,.0f}", "▣", T["amber"], "units"),
+            ui.kpi("Optimal order qty Q*", fmt(bst["Q"]), f"baseline EOQ {b0['Q']:,.0f}", "▣", T["amber"], "units"),
             ui.kpi("Annual cost (validated)", f"£{vb['total_cost']:,.0f}", (f"<span class='up'>−{imp:.1%}</span>" if imp > 0 else f"<span class='down'>{-imp:+.1%}</span>") + f" vs baseline £{v0['total_cost']:,.0f}", "£", T["green"] if imp > 0 else T["red"]),
         ]) + ui.kpi_row([
             ui.kpi("Fill rate β (validated)", f"{vb['fill_rate']:.2%}", f"target ≥ {bo['cp'].target_fill:.1%} · baseline {v0['fill_rate']:.2%}", "◐", T["green"] if vb["fill_rate"] >= bo["cp"].target_fill else T["red"]),
@@ -771,254 +979,275 @@ exposures to lead-time risk per year, which is why fill rate (β) can rise even 
 **{-imp:+.1%}** on an independent simulation.""")
         st.download_button("⬇ Download trial history (CSV)", tr.to_csv(index=False).encode(), f"bayes_opt_trials_{FOCUS}.csv", "text/csv")
 
-# ================================================================== TAB 6 · INVENTORY INTELLIGENCE
+    # ---------------- Before AI: manual grid sweep vs Bayesian optimisation
+    st.markdown(ui.section("Manual sweep (before AI) vs Bayesian optimisation", "Same simulator, same random numbers, same bounds", "before / after"), unsafe_allow_html=True)
+    bo = ss.get("bo")
+    if not bo or bo["sku"] != FOCUS:
+        st.info("Run the Bayesian optimisation above first; the sweep reuses its scenario.")
+    else:
+        c1, c2 = st.columns([1, 2.2], gap="medium", vertical_alignment="center")
+        g = c1.select_slider("Grid resolution (points per axis)", [5, 8, 10, 12, 15], 10, key="bo_grid")
+        if c1.button(f"Run manual sweep ({g * g} evaluations)", width="stretch"):
+            sim = O.PolicySimulator(*bo["sim_args"], **bo["sim_kw"])
+            S_ = np.linspace(*bo["bounds"]["s"], g); Q_ = np.linspace(*bo["bounds"]["Q"], g)
+            rows, bar = [], st.progress(0.0)
+            for i, s_ in enumerate(S_):
+                for q_ in Q_:
+                    r_ = sim.run(round(s_), round(max(q_, bo["cp"].moq)), bo["cp"])
+                    rows.append({**r_, "objective": O.penalised(r_, bo["base"]["total_cost"])})
+                bar.progress((i + 1) / g)
+            bar.empty()
+            gs = pd.DataFrame(rows); gs["eval"] = np.arange(1, len(gs) + 1); gs["best_so_far"] = gs["objective"].cummin()
+            ss.bo_grid_res = {"df": gs, "sku": FOCUS, "g": g}
+        gr = ss.get("bo_grid_res")
+        if gr and gr["sku"] == FOCUS:
+            gs, tr = gr["df"], bo["res"]["trials"]
+            gb, bb = gs[gs.feasible].total_cost.min(), bo["res"]["best"]["total_cost"]
+            hit = tr.index[tr["best_so_far"] <= gs["objective"].min() * 1.001]
+            n_bo = int(tr.loc[hit[0], "trial"]) if len(hit) else None
+            c2.markdown(ui.kpi_row([
+                ui.kpi("Manual sweep best", f"£{gb:,.0f}", f"after {len(gs)} evaluations", "▦", T["muted"]),
+                ui.kpi("Bayesian best", f"£{bb:,.0f}", f"after {len(tr)} evaluations", "★", T["primary"]),
+                ui.kpi("Evaluations saved", f"{(1 - len(tr) / len(gs)):.0%}", (f"BO matched the sweep at evaluation {n_bo}" if n_bo else "BO found a different optimum") , "⚡", T["green"]),
+            ], 3), unsafe_allow_html=True)
+            fig = go.Figure()
+            fig.add_trace(go.Scatter(x=gs["eval"], y=gs["best_so_far"], name=f"Manual grid sweep ({gr['g']}×{gr['g']})", line=dict(color=T["muted"], width=2.5, shape="hv")))
+            fig.add_trace(go.Scatter(x=tr["trial"], y=tr["best_so_far"], name="Bayesian optimisation", line=dict(color=T["primary"], width=3, shape="hv")))
+            fig.update_layout(title="Best cost found vs number of evaluations", xaxis_title="Evaluations", yaxis_title="Penalised annual cost (£)", yaxis_type="log")
+            fig_(fig, 340)
+
+    # ---------------- Automation: tune every SKU
+    st.markdown(ui.section("Auto-tune the whole portfolio", "Bayesian optimisation (TPE) of (s, Q) for every SKU in one click", "automation"), unsafe_allow_html=True)
+    c1, c2, c3 = st.columns([1, 1, 1.2], gap="medium", vertical_alignment="bottom")
+    pt_trials = c1.select_slider("Evaluations per SKU", [10, 15, 20, 30], 20, key="pt_trials")
+    pt_fill = c2.slider("Min fill rate", 0.85, 0.99, 0.95, 0.01, key="pt_fill")
+    if c3.button(f"⚙ Auto-tune all {len(P)} SKUs", type="primary", width="stretch"):
+        bar = st.progress(0.0, text="Optimising…")
+        ss.portfolio_tune = A.tune_portfolio(P, L_wk, sdL_wk, ss.holding_rate, ss.order_cost, ss.short_mult, pt_fill, pt_trials,
+                                             progress=lambda i, n, s_: bar.progress(i / n, text=f"Bayesian optimisation {i}/{n} · {s_}"))
+        bar.empty()
+    pt = ss.get("portfolio_tune")
+    if pt is not None:
+        st.markdown(ui.kpi_row([
+            ui.kpi("Cost · formula policy", f"£{pt.cost_formula.sum():,.0f}", "analytical ROP + EOQ (per year)", "▦", T["muted"]),
+            ui.kpi("Cost · AI-tuned", f"£{pt.cost_opt.sum():,.0f}", f"<span class='up'>−{1 - pt.cost_opt.sum() / pt.cost_formula.sum():.1%}</span>", "★", T["primary"]),
+            ui.kpi("SKUs improved", f"{(pt.saving_pct > 0.5).sum()}/{len(pt)}", f"median saving {pt.saving_pct.median():.1f}%", "✓", T["green"]),
+            ui.kpi("Constraint-feasible", f"{pt.feasible.mean():.0%}", f"fill rate ≥ {pt_fill:.0%}", "◐", T["blue"]),
+        ]), unsafe_allow_html=True)
+        fig = go.Figure(go.Bar(x=pt.sort_values("saving_pct")["sku"], y=pt.sort_values("saving_pct")["saving_pct"],
+                               marker=dict(color=np.where(pt.sort_values("saving_pct")["saving_pct"] > 0, T["primary"], T["red"]), cornerradius=4),
+                               hovertext=pt.sort_values("saving_pct")["description"]))
+        fig.update_layout(title="Annual cost saving per SKU from Bayesian tuning (%)", xaxis_tickangle=-60)
+        fig_(fig, 340, legend=False)
+        st.download_button("⬇ Tuned policies for all SKUs (CSV)", pt.to_csv(index=False).encode(), "ai_tuned_policies.csv", "text/csv")
+
+# ================================================================== TAB 6 · DATA & REPORTS
 with tabs[5]:
-    st.markdown(ui.section("Inventory intelligence", "Operational SKU table — every value recomputes with the sidebar", "portfolio"), unsafe_allow_html=True)
-    cnt = P["status"].value_counts()
-    st.markdown(ui.kpi_row([ui.kpi(s_, f"{int(cnt.get(s_, 0))}", f"{cnt.get(s_, 0) / len(P):.0%} of SKUs", ui.STATUS_ICON[s_], SC[s_]) for s_ in I.STATUS_ORDER[::-1]]), unsafe_allow_html=True)
-    c = st.columns([1.4, 1, 1])
-    fstat = c[0].multiselect("Status filter", I.STATUS_ORDER, I.STATUS_ORDER, key="inv_status")
-    q_ = c[1].text_input("Search SKU / product", key="inv_q")
-    sort_by = c[2].selectbox("Sort by", ["Status & risk", "Stockout risk", "Forecast demand", "Weeks of cover", "Stock value"], key="inv_sort")
-    V = P[P["status"].isin(fstat)]
-    if q_:
-        V = V[V["sku"].str.contains(q_, case=False) | V["description"].str.contains(q_, case=False)]
-    V = {"Status & risk": V.sort_values(["status_rank", "risk"], ascending=[True, False]), "Stockout risk": V.sort_values("risk", ascending=False),
-         "Forecast demand": V.sort_values("fc_total4", ascending=False), "Weeks of cover": V.sort_values("weeks_cover"),
-         "Stock value": V.sort_values("stock_value", ascending=False)}[sort_by]
-    cols = ["sku", "description", "status", "fc_total4", "d_bar", "on_hand", "on_order", "inv_position", "ss", "rop", "order_qty", "risk", "weeks_cover", "stock_value", "action"]
-    st.dataframe(V[cols], hide_index=True, width="stretch", height=520, column_config={
-        "sku": "SKU", "description": "Product", "status": "Status",
-        "fc_total4": st.column_config.NumberColumn("Forecast 4 wk", format="%.0f"), "d_bar": st.column_config.NumberColumn("D̄ / wk", format="%.0f"),
-        "on_hand": st.column_config.NumberColumn("On hand*", format="%.0f"), "on_order": st.column_config.NumberColumn("On order", format="%.0f"),
-        "inv_position": st.column_config.NumberColumn("Position", format="%.0f"), "ss": st.column_config.NumberColumn("Safety stock", format="%.0f"),
-        "rop": st.column_config.NumberColumn("ROP", format="%.0f"), "order_qty": st.column_config.NumberColumn("Order qty", format="%.0f"),
-        "risk": st.column_config.ProgressColumn("Stockout risk", min_value=0, max_value=1, format="percent"),
-        "weeks_cover": st.column_config.NumberColumn("Wks cover", format="%.1f"), "stock_value": st.column_config.NumberColumn("Value £", format="£%.0f"),
-        "action": "Recommended action"})
-    st.caption("*On-hand is a **simulated scenario** (no stock data exists in the source). Edit it below to model your own position.")
-    c1, c2 = st.columns([1.4, 1])
-    with c1:
-        fig = px.scatter(P, x="weeks_cover", y="risk", size="fc_total4", color="status", color_discrete_map=SC, hover_name="sku",
-                         hover_data={"description": True, "rop": ":.0f", "inv_position": ":.0f", "fc_total4": ":.0f"}, size_max=38,
-                         category_orders={"status": I.STATUS_ORDER})
-        fig.add_hline(y=1 - svc, line=dict(color=T["amber"], dash="dot"), annotation_text="risk tolerance 1−α")
-        fig.update_layout(title="Risk map: weeks of cover vs stockout risk (bubble = forecast demand)", yaxis_tickformat=".0%", xaxis_type="log")
-        fig_(fig, 420)
-    with c2:
-        with st.expander("✏️ Edit scenario stock (on hand / on order / backorders)", expanded=True):
-            ed = st.data_editor(P[["sku", "on_hand", "on_order", "backorders"]], hide_index=True, width="stretch", height=330,
-                                disabled=["sku"], key="stock_editor", column_config={c: st.column_config.NumberColumn(min_value=0, step=1, format="%.0f") for c in ["on_hand", "on_order", "backorders"]})
-            if st.button("Apply stock changes", type="primary", width="stretch"):
-                ss.stock_edits = {r.sku: {"on_hand": float(r.on_hand), "on_order": float(r.on_order), "backorders": float(r.backorders)} for r in ed.itertuples()}
-                st.rerun()
-    st.download_button("⬇ Export inventory table (CSV)", V[cols].to_csv(index=False).encode(), "inventory_intelligence.csv", "text/csv", type="primary")
+    v6 = st.segmented_control("Data & reports view", ["Data manager", "Reports & exports", "Assignment map & method"],
+                              default="Data manager", key="v6_view", label_visibility="collapsed") or "Data manager"
+    if v6 == "Data manager":
+        st.markdown(ui.section("Data manager", "Add new data → validate → reconcile → re-forecast → recompute buffers & recommendations", "ingestion"), unsafe_allow_html=True)
+        c1, c2 = st.columns([1.15, 1])
+        with c1:
+            st.markdown(f"""<div class='card'><h4>Active dataset</h4>
+            <div style='font-size:.86rem'><b>{ss.data_source}</b><br>
+            {len(ss.df):,} rows · {ss.df['sku'].nunique()} SKUs · {ss.df['date'].min():%d %b %Y} → {ss.df['date'].max():%d %b %Y}<br>
+            Last successful ingestion: <b>{ss.last_ingest}</b> (on-demand batch refresh — not a real-time feed)</div>
+            <div style='font-size:.8rem;color:var(--muted);margin-top:8px'>Source: Chen, D. (2019) <i>Online Retail II</i>, UCI Machine Learning Repository,
+            doi:10.24432/C5CG6D, CC BY 4.0 — 1,067,371 transactions of a UK-based online gift wholesaler, Dec 2009 – Dec 2011. Cleaned (cancellations,
+            returns, non-product codes and 99.9th-pct bulk outliers removed) and aggregated to daily demand for the 40 highest-volume SKUs sold on ≥400 days.</div></div>""", unsafe_allow_html=True)
+            prov = pd.DataFrame([
+                ["Daily demand (units), SKU, description, date", "Observed", "UCI Online Retail II invoices"],
+                ["Average selling price", "Observed", "Invoice line price, quantity-weighted"],
+                ["Weekly/monthly series, calendar & Q4-peak features", "Derived", "Aggregation & feature engineering"],
+                ["Forecasts, σ of forecast error, SS, ROP, EOQ, risk", "Derived", "Models & formulas in this app"],
+                ["Service level, lead time & σ, costs, capacity, budget, MOQ", "Configured", "Sidebar / tab controls"],
+                ["Stock on hand, on order, backorders", "Simulated", "Seeded scenario — not in source data"],
+                ["Promotions", "Not available", "No promo flag in source; price used as proxy, nothing fabricated"],
+            ], columns=["Field", "Type", "Origin"])
+            st.dataframe(prov, hide_index=True, width="stretch")
+        with c2:
+            weekly_all = ss.df.groupby([pd.Grouper(key="date", freq="W-SUN"), "sku"])["demand"].sum().reset_index()
+            cov = weekly_all.groupby("date")["sku"].nunique()
+            fig = go.Figure(go.Bar(x=cov.index, y=cov.values, marker_color=T["primary"]))
+            fig.update_layout(title="Data coverage: SKUs with sales per week")
+            fig_(fig, 300, legend=False)
+            tmpl = pd.DataFrame({"date": ["2011-12-12", "2011-12-12"], "sku": ["85099B", "84879"], "demand": [120, 64],
+                                 "description": ["JUMBO BAG RED RETROSPOT", "ASSORTED COLOUR BIRD ORNAMENT"], "avg_price": [1.95, 1.69]})
+            st.download_button("⬇ Download CSV template", tmpl.to_csv(index=False).encode(), "new_data_template.csv", "text/csv", width="stretch")
 
-# ================================================================== TAB 7 · DATA MANAGER
-with tabs[6]:
-    st.markdown(ui.section("Data manager", "Add new data → validate → reconcile → re-forecast → recompute buffers & recommendations", "ingestion"), unsafe_allow_html=True)
-    c1, c2 = st.columns([1.15, 1])
-    with c1:
-        st.markdown(f"""<div class='card'><h4>Active dataset</h4>
-        <div style='font-size:.86rem'><b>{ss.data_source}</b><br>
-        {len(ss.df):,} rows · {ss.df['sku'].nunique()} SKUs · {ss.df['date'].min():%d %b %Y} → {ss.df['date'].max():%d %b %Y}<br>
-        Last successful ingestion: <b>{ss.last_ingest}</b> (on-demand batch refresh — not a real-time feed)</div>
-        <div style='font-size:.8rem;color:var(--muted);margin-top:8px'>Source: Chen, D. (2019) <i>Online Retail II</i>, UCI Machine Learning Repository,
-        doi:10.24432/C5CG6D, CC BY 4.0 — 1,067,371 transactions of a UK-based online gift wholesaler, Dec 2009 – Dec 2011. Cleaned (cancellations,
-        returns, non-product codes and 99.9th-pct bulk outliers removed) and aggregated to daily demand for the 40 highest-volume SKUs sold on ≥400 days.</div></div>""", unsafe_allow_html=True)
-        prov = pd.DataFrame([
-            ["Daily demand (units), SKU, description, date", "Observed", "UCI Online Retail II invoices"],
-            ["Average selling price", "Observed", "Invoice line price, quantity-weighted"],
-            ["Weekly/monthly series, calendar & Q4-peak features", "Derived", "Aggregation & feature engineering"],
-            ["Forecasts, σ of forecast error, SS, ROP, EOQ, risk", "Derived", "Models & formulas in this app"],
-            ["Service level, lead time & σ, costs, capacity, budget, MOQ", "Configured", "Sidebar / tab controls"],
-            ["Stock on hand, on order, backorders", "Simulated", "Seeded scenario — not in source data"],
-            ["Promotions", "Not available", "No promo flag in source; price used as proxy, nothing fabricated"],
-        ], columns=["Field", "Type", "Origin"])
-        st.dataframe(prov, hide_index=True, width="stretch")
-    with c2:
-        weekly_all = ss.df.groupby([pd.Grouper(key="date", freq="W-SUN"), "sku"])["demand"].sum().reset_index()
-        cov = weekly_all.groupby("date")["sku"].nunique()
-        fig = go.Figure(go.Bar(x=cov.index, y=cov.values, marker_color=T["primary"]))
-        fig.update_layout(title="Data coverage: SKUs with sales per week")
-        fig_(fig, 300, legend=False)
-        tmpl = pd.DataFrame({"date": ["2011-12-12", "2011-12-12"], "sku": ["85099B", "84879"], "demand": [120, 64],
-                             "description": ["JUMBO BAG RED RETROSPOT", "ASSORTED COLOUR BIRD ORNAMENT"], "avg_price": [1.95, 1.69]})
-        st.download_button("⬇ Download CSV template", tmpl.to_csv(index=False).encode(), "new_data_template.csv", "text/csv", width="stretch")
+        st.markdown(ui.section("Upload new observations", "CSV · automatic column detection with manual override"), unsafe_allow_html=True)
+        up = st.file_uploader("CSV file (transactions or daily demand)", type=["csv"], key="uploader")
+        if up is not None:
+            try:
+                raw = pd.read_csv(up)
+            except Exception as e:
+                raw = None
+                st.error(f"Could not read CSV: {e}")
+            if raw is not None:
+                guess = D.detect_columns(raw.columns)
+                st.caption(f"{len(raw):,} rows · columns: {', '.join(map(str, raw.columns[:12]))}")
+                cc = st.columns(5)
+                opts = ["— none —"] + list(raw.columns)
+                mapping = {}
+                for i, fld in enumerate(D.REQUIRED + D.OPTIONAL):
+                    g = guess.get(fld)
+                    sel = cc[i].selectbox(f"{fld}{' *' if fld in D.REQUIRED else ''}", opts, index=opts.index(g) if g in opts else 0, key=f"map_{fld}")
+                    if sel != "— none —":
+                        mapping[fld] = sel
+                new, rep = D.validate(raw, mapping)
+                if not rep.ok:
+                    st.error(" · ".join(rep.messages) or "Validation failed")
+                else:
+                    m1, m2, m3, m4 = st.columns(4)
+                    m1.metric("Valid rows", f"{rep.rows_valid:,}", f"of {rep.rows_in:,} input")
+                    m2.metric("SKUs", rep.skus, f"{len(set(new['sku']) - set(ss.df['sku']))} new")
+                    m3.metric("Date range", rep.date_min, rep.date_max, delta_color="off")
+                    m4.metric("Overlapping SKU-days", f"{len(ss.df.merge(new[['date', 'sku']], on=['date', 'sku'])):,}")
+                    for msg in rep.messages:
+                        st.warning(msg)
+                    st.dataframe(new.head(50), width="stretch", height=200)
+                    mode_ = st.radio("On overlap with existing (date, SKU)", ["replace", "add"], horizontal=True,
+                                     format_func=lambda m: "Replace with new values (corrections)" if m == "replace" else "Add to existing (late transactions)")
+                    if st.button("✅ Ingest & refresh all models", type="primary"):
+                        merged, info = D.merge_new(ss.df, new, mode_)
+                        ss.df = merged
+                        ss.last_ingest = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+                        ss.data_source = ss.data_source.split(" + ")[0] + " + user upload"
+                        ss.ingest_log.append({"time": ss.last_ingest, "event": f"Upload '{up.name}' ({mode_})", "rows": rep.rows_valid, **info})
+                        ss.pop("bo", None); ss.pop("mc_params", None)
+                        st.success(f"Ingested {info['added_rows']:,} new and reconciled {info['reconciled_rows']:,} existing rows. Forecasts, safety stock, ROP and recommendations refreshed.")
+                        st.rerun()
 
-    st.markdown(ui.section("Upload new observations", "CSV · automatic column detection with manual override"), unsafe_allow_html=True)
-    up = st.file_uploader("CSV file (transactions or daily demand)", type=["csv"], key="uploader")
-    if up is not None:
-        try:
-            raw = pd.read_csv(up)
-        except Exception as e:
-            raw = None
-            st.error(f"Could not read CSV: {e}")
-        if raw is not None:
-            guess = D.detect_columns(raw.columns)
-            st.caption(f"{len(raw):,} rows · columns: {', '.join(map(str, raw.columns[:12]))}")
-            cc = st.columns(5)
-            opts = ["— none —"] + list(raw.columns)
-            mapping = {}
-            for i, fld in enumerate(D.REQUIRED + D.OPTIONAL):
-                g = guess.get(fld)
-                sel = cc[i].selectbox(f"{fld}{' *' if fld in D.REQUIRED else ''}", opts, index=opts.index(g) if g in opts else 0, key=f"map_{fld}")
-                if sel != "— none —":
-                    mapping[fld] = sel
-            new, rep = D.validate(raw, mapping)
-            if not rep.ok:
-                st.error(" · ".join(rep.messages) or "Validation failed")
-            else:
-                m1, m2, m3, m4 = st.columns(4)
-                m1.metric("Valid rows", f"{rep.rows_valid:,}", f"of {rep.rows_in:,} input")
-                m2.metric("SKUs", rep.skus, f"{len(set(new['sku']) - set(ss.df['sku']))} new")
-                m3.metric("Date range", rep.date_min, rep.date_max, delta_color="off")
-                m4.metric("Overlapping SKU-days", f"{len(ss.df.merge(new[['date', 'sku']], on=['date', 'sku'])):,}")
-                for msg in rep.messages:
-                    st.warning(msg)
-                st.dataframe(new.head(50), width="stretch", height=200)
-                mode_ = st.radio("On overlap with existing (date, SKU)", ["replace", "add"], horizontal=True,
-                                 format_func=lambda m: "Replace with new values (corrections)" if m == "replace" else "Add to existing (late transactions)")
-                if st.button("✅ Ingest & refresh all models", type="primary"):
-                    merged, info = D.merge_new(ss.df, new, mode_)
-                    ss.df = merged
+        c1, c2 = st.columns([1.2, 1])
+        with c1:
+            st.markdown(ui.section("Add a single observation", "e.g. today's sales for a SKU"), unsafe_allow_html=True)
+            with st.form("manual_add", clear_on_submit=True):
+                a, b, c_ = st.columns(3)
+                dt_ = a.date_input("Date", value=(ss.df["date"].max() + pd.Timedelta(days=1)).date())
+                sk_ = b.selectbox("SKU", sku_opts, format_func=lambda s: f"{s} · {str(labels.get(s, ''))[:22]}")
+                qt_ = c_.number_input("Units sold", 0.0, value=0.0, step=1.0)
+                if st.form_submit_button("➕ Add observation & refresh", type="primary"):
+                    new = pd.DataFrame({"date": [pd.Timestamp(dt_)], "sku": [sk_], "demand": [qt_], "description": [labels.get(sk_)],
+                                        "avg_price": [ss.df.loc[ss.df.sku == sk_, "avg_price"].iloc[-1]]})
+                    ss.df, info = D.merge_new(ss.df, new, "replace")
                     ss.last_ingest = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-                    ss.data_source = ss.data_source.split(" + ")[0] + " + user upload"
-                    ss.ingest_log.append({"time": ss.last_ingest, "event": f"Upload '{up.name}' ({mode_})", "rows": rep.rows_valid, **info})
-                    ss.pop("bo", None); ss.pop("mc_params", None)
-                    st.success(f"Ingested {info['added_rows']:,} new and reconciled {info['reconciled_rows']:,} existing rows. Forecasts, safety stock, ROP and recommendations refreshed.")
+                    ss.ingest_log.append({"time": ss.last_ingest, "event": f"Manual entry {sk_} {dt_} = {qt_:,.0f}", "rows": 1, **info})
+                    ss.pop("bo", None)
                     st.rerun()
-
-    c1, c2 = st.columns([1.2, 1])
-    with c1:
-        st.markdown(ui.section("Add a single observation", "e.g. today's sales for a SKU"), unsafe_allow_html=True)
-        with st.form("manual_add", clear_on_submit=True):
-            a, b, c_ = st.columns(3)
-            dt_ = a.date_input("Date", value=(ss.df["date"].max() + pd.Timedelta(days=1)).date())
-            sk_ = b.selectbox("SKU", sku_opts, format_func=lambda s: f"{s} · {str(labels.get(s, ''))[:22]}")
-            qt_ = c_.number_input("Units sold", 0.0, value=0.0, step=1.0)
-            if st.form_submit_button("➕ Add observation & refresh", type="primary"):
-                new = pd.DataFrame({"date": [pd.Timestamp(dt_)], "sku": [sk_], "demand": [qt_], "description": [labels.get(sk_)],
-                                    "avg_price": [ss.df.loc[ss.df.sku == sk_, "avg_price"].iloc[-1]]})
-                ss.df, info = D.merge_new(ss.df, new, "replace")
+        with c2:
+            st.markdown(ui.section("Ingestion log", "this session only"), unsafe_allow_html=True)
+            st.dataframe(pd.DataFrame(ss.ingest_log).iloc[::-1], hide_index=True, width="stretch", height=180)
+            if st.button("↺ Restore original dataset", width="stretch"):
+                ss.df = D.load_default(); ss.data_source = "UCI Online Retail II (processed: 40 SKUs, daily demand)"
                 ss.last_ingest = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-                ss.ingest_log.append({"time": ss.last_ingest, "event": f"Manual entry {sk_} {dt_} = {qt_:,.0f}", "rows": 1, **info})
-                ss.pop("bo", None)
+                ss.ingest_log.append({"time": ss.last_ingest, "event": "Restored original dataset", "rows": len(ss.df)})
+                ss.pop("bo", None); ss.pop("mc_params", None)
                 st.rerun()
-    with c2:
-        st.markdown(ui.section("Ingestion log", "this session only"), unsafe_allow_html=True)
-        st.dataframe(pd.DataFrame(ss.ingest_log).iloc[::-1], hide_index=True, width="stretch", height=180)
-        if st.button("↺ Restore original dataset", width="stretch"):
-            ss.df = D.load_default(); ss.data_source = "UCI Online Retail II (processed: 40 SKUs, daily demand)"
-            ss.last_ingest = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-            ss.ingest_log.append({"time": ss.last_ingest, "event": "Restored original dataset", "rows": len(ss.df)})
-            ss.pop("bo", None); ss.pop("mc_params", None)
-            st.rerun()
+    elif v6 == "Reports & exports":
+        st.markdown(ui.section("Reports & model diagnostics", "All outputs downloadable · computed live"), unsafe_allow_html=True)
+        y_, pr_, bt_ = run_backtest(ss.df, FOCUS, "W", 8, tuple(F.MODELS), 3)
+        c1, c2 = st.columns([1.3, 1])
+        with c1:
+            pw = P.sort_values("fc_wape")
+            fig = go.Figure(go.Bar(x=pw["sku"], y=pw["fc_wape"], marker=dict(color=pw["fc_wape"], colorscale=[[0, T["primary"]], [0.5, T["amber"]], [1, T["red"]]], cornerradius=4),
+                                   hovertext=pw["description"]))
+            fig.add_hline(y=pw["fc_wape"].median(), line=dict(color=T["text"], dash="dot"), annotation_text=f"median {pw['fc_wape'].median():.1f}%")
+            fig.update_layout(title="Forecast accuracy across portfolio (8-week hold-out WAPE, damped ETS)", xaxis_tickangle=-60)
+            fig_(fig, 360, legend=False)
+        with c2:
+            resid = bt_["test_actual"] - bt_["test_preds"][bt_["best"]]
+            fig = make_subplots(rows=1, cols=2, subplot_titles=("Test residuals over time", "Residual distribution"))
+            fig.add_trace(go.Bar(x=resid.index, y=resid.values, marker_color=np.where(resid.values > 0, T["blue"], T["amber"])), 1, 1)
+            fig.add_trace(go.Histogram(x=resid.values, nbinsx=10, marker_color=T["primary"]), 1, 2)
+            fig.update_layout(title=f"{FOCUS} · {bt_['best']} residual diagnostics")
+            fig_(fig, 360, legend=False)
+        c1, c2 = st.columns(2)
+        with c1:
+            st.markdown(ui.section("Forecast accuracy report", f"{FOCUS} · weekly · 8-week test"), unsafe_allow_html=True)
+            rep_fc = bt_["validation"].drop(columns="resid_sd").add_prefix("val_").join(bt_["test"].add_prefix("test_")).round(2)
+            st.dataframe(rep_fc, width="stretch")
+        with c2:
+            st.markdown(ui.section("Safety-stock comparison", "analytical vs Monte Carlo (Safety Stock tab inputs)"), unsafe_allow_html=True)
+            cmp_ = ss.get("ssc_compare")
+            if cmp_ is not None:
+                st.dataframe(cmp_.round(1), hide_index=True, width="stretch")
+        c1, c2 = st.columns(2)
+        with c1:
+            st.markdown(ui.section("Monte Carlo scenario results"), unsafe_allow_html=True)
+            if ss.get("mc_scenarios") is not None:
+                st.dataframe(ss["mc_scenarios"].round(3), hide_index=True, width="stretch")
+        with c2:
+            st.markdown(ui.section("Optimisation summary"), unsafe_allow_html=True)
+            bo = ss.get("bo")
+            if bo:
+                st.dataframe(pd.DataFrame({"Baseline": bo["val_base"], "Optimised": bo["val_best"]}).drop(index=["viol_fill", "viol_capacity", "viol_budget"]).astype(str),
+                             width="stretch", height=300)
+            else:
+                st.info("Run the Bayesian Optimization tab to populate this section.")
+        st.markdown(ui.section("Dataset quality report", "per SKU · daily level"), unsafe_allow_html=True)
+        dq = D.dataset_quality(ss.df)
+        st.dataframe(dq, hide_index=True, width="stretch", height=300)
 
-# ================================================================== TAB 8 · REPORTS
-with tabs[7]:
-    st.markdown(ui.section("Reports & model diagnostics", "All outputs downloadable · computed live"), unsafe_allow_html=True)
-    y_, pr_, bt_ = run_backtest(ss.df, FOCUS, "W", 8, tuple(F.MODELS), 3)
-    c1, c2 = st.columns([1.3, 1])
-    with c1:
-        pw = P.sort_values("fc_wape")
-        fig = go.Figure(go.Bar(x=pw["sku"], y=pw["fc_wape"], marker=dict(color=pw["fc_wape"], colorscale=[[0, T["primary"]], [0.5, T["amber"]], [1, T["red"]]], cornerradius=4),
-                               hovertext=pw["description"]))
-        fig.add_hline(y=pw["fc_wape"].median(), line=dict(color=T["text"], dash="dot"), annotation_text=f"median {pw['fc_wape'].median():.1f}%")
-        fig.update_layout(title="Forecast accuracy across portfolio (8-week hold-out WAPE, damped ETS)", xaxis_tickangle=-60)
-        fig_(fig, 360, legend=False)
-    with c2:
-        resid = bt_["test_actual"] - bt_["test_preds"][bt_["best"]]
-        fig = make_subplots(rows=1, cols=2, subplot_titles=("Test residuals over time", "Residual distribution"))
-        fig.add_trace(go.Bar(x=resid.index, y=resid.values, marker_color=np.where(resid.values > 0, T["blue"], T["amber"])), 1, 1)
-        fig.add_trace(go.Histogram(x=resid.values, nbinsx=10, marker_color=T["primary"]), 1, 2)
-        fig.update_layout(title=f"{FOCUS} · {bt_['best']} residual diagnostics")
-        fig_(fig, 360, legend=False)
-    c1, c2 = st.columns(2)
-    with c1:
-        st.markdown(ui.section("Forecast accuracy report", f"{FOCUS} · weekly · 8-week test"), unsafe_allow_html=True)
-        rep_fc = bt_["validation"].drop(columns="resid_sd").add_prefix("val_").join(bt_["test"].add_prefix("test_")).round(2)
-        st.dataframe(rep_fc, width="stretch")
-    with c2:
-        st.markdown(ui.section("Safety-stock comparison", "analytical vs Monte Carlo (Safety Stock tab inputs)"), unsafe_allow_html=True)
-        cmp_ = ss.get("ssc_compare")
-        if cmp_ is not None:
-            st.dataframe(cmp_.round(1), hide_index=True, width="stretch")
-    c1, c2 = st.columns(2)
-    with c1:
-        st.markdown(ui.section("Monte Carlo scenario results"), unsafe_allow_html=True)
-        if ss.get("mc_scenarios") is not None:
-            st.dataframe(ss["mc_scenarios"].round(3), hide_index=True, width="stretch")
-    with c2:
-        st.markdown(ui.section("Optimisation summary"), unsafe_allow_html=True)
-        bo = ss.get("bo")
-        if bo:
-            st.dataframe(pd.DataFrame({"Baseline": bo["val_base"], "Optimised": bo["val_best"]}).drop(index=["viol_fill", "viol_capacity", "viol_budget"]).astype(str),
-                         width="stretch", height=300)
-        else:
-            st.info("Run the Bayesian Optimization tab to populate this section.")
-    st.markdown(ui.section("Dataset quality report", "per SKU · daily level"), unsafe_allow_html=True)
-    dq = D.dataset_quality(ss.df)
-    st.dataframe(dq, hide_index=True, width="stretch", height=300)
-
-    buf = io.BytesIO()
-    with pd.ExcelWriter(buf, engine="openpyxl") as xw:
-        pd.DataFrame({"Field": ["Student", "ID", "Programme", "Course", "Generated", "Service level", "Lead time (d)", "Lead-time σ (d)", "Demand basis"],
-                      "Value": [STUDENT["name"], STUDENT["id"], f"{STUDENT['prog']} {STUDENT['batch']}", f"{STUDENT['course']} — {STUDENT['lab']}",
-                                datetime.now().strftime("%Y-%m-%d %H:%M"), svc, ss.lt_days, ss.lt_sd_days, ss.basis]}).to_excel(xw, sheet_name="Cover", index=False)
-        P[cols].to_excel(xw, sheet_name="Inventory", index=False)
-        rep_fc.to_excel(xw, sheet_name="Forecast accuracy")
-        if cmp_ is not None:
-            cmp_.to_excel(xw, sheet_name="SS comparison", index=False)
-        if ss.get("mc_scenarios") is not None:
-            ss["mc_scenarios"].to_excel(xw, sheet_name="MC scenarios", index=False)
-        if bo:
-            bo["res"]["trials"].to_excel(xw, sheet_name="BO trials", index=False)
-        dq.to_excel(xw, sheet_name="Data quality", index=False)
-    c = st.columns(4)
-    c[0].download_button("⬇ Full report (Excel)", buf.getvalue(), f"AI_Inventory_Report_{STUDENT['id']}.xlsx", type="primary", width="stretch")
-    c[1].download_button("⬇ Inventory CSV", P[cols].to_csv(index=False).encode(), "inventory.csv", width="stretch")
-    c[2].download_button("⬇ Forecast accuracy CSV", rep_fc.to_csv().encode(), f"forecast_accuracy_{FOCUS}.csv", width="stretch")
-    c[3].download_button("⬇ Data quality CSV", dq.to_csv(index=False).encode(), "data_quality.csv", width="stretch")
-
-# ================================================================== TAB 9 · METHODOLOGY
-with tabs[8]:
-    st.markdown(ui.section("Assignment → implementation map", "Session II: AI Applications in Reorder Point & Inventory Management — Exercise"), unsafe_allow_html=True)
-    st.markdown("""<div class='card'><b>Objective (from the brief):</b> enhance the reorder-point calculator and sensitivity analysis by introducing
-    predictive intelligence, adaptive decision-making and real-time optimisation.</div>""", unsafe_allow_html=True)
-    req = pd.DataFrame([
-        ["1. Demand forecasting", "ML models (time series, regression, LSTM)", "Naive, Seasonal Naive, MA, ETS, ARIMA/SARIMA, Gradient Boosting regression, MLP neural net (LSTM assessed — see note)", "Demand Forecasting"],
-        ["1. Demand forecasting", "Historical data, seasonality, promotions, external factors", "2 years of real invoices; STL + Fourier calendar features; price as promo proxy; Q4 peak flag", "Demand Forecasting"],
-        ["1. Demand forecasting", "Possibility of adding new data", "CSV upload with auto/manual column mapping, validation, dedupe, reconciliation; manual entry", "Data Manager"],
-        ["1. Demand forecasting", "Continuously update forecasts", "Content-hashed caches → every ingestion retrains, re-backtests and refreshes all KPIs; timestamped", "All tabs"],
-        ["2. Dynamic safety stock", "Probabilistic model: demand & lead-time variability", "SS = Z√(σ²_D·L + D̄²·σ²_L) with σ_D from live forecast error (dynamic)", "Safety Stock & ROP"],
-        ["2. Dynamic safety stock", "Monte Carlo risk scenarios & buffers", "10k–100k draws, 5 demand × 5 lead-time distributions, copula dependence, 5 stress scenarios", "Monte Carlo Risk"],
-        ["3. AI sensitivity analysis", "Bayesian optimisation of ROP under constraints", "GP-EI (Matern-5/2) and Optuna TPE over (s, Q) with fill-rate, capacity, budget, MOQ constraints; CRN + independent validation", "Bayesian Optimization"],
-        ["Condition", "No sharing of data with peers", "Local single-user session; uploads held in session memory only; no telemetry", "Sidebar note"],
-    ], columns=["Workstream", "Requirement", "Implementation", "Where"])
-    st.dataframe(req, hide_index=True, width="stretch")
-    c1, c2 = st.columns(2)
-    with c1:
-        st.markdown("#### Key formulas")
-        st.latex(r"Z = \Phi^{-1}(\alpha)\qquad \sigma_{LTD}=\sqrt{\sigma_D^2L+\bar D^2\sigma_L^2}")
-        st.latex(r"SS = Z\,\sigma_{LTD}\qquad ROP=\bar D L + SS\qquad EOQ=\sqrt{2DK/h}")
-        st.latex(r"P(\text{stockout}) = 1-\Phi\!\left(\tfrac{IP-\bar D L}{\sigma_{LTD}}\right)\qquad \beta = 1-\tfrac{\sigma_{LTD}\,G(Z)}{Q}")
-        st.latex(r"\text{WAPE}=\tfrac{\sum|y-\hat y|}{\sum|y|}\qquad \text{EI}(x)=\mathbb{E}[\max(f^{*}-f(x),0)]")
-    with c2:
-        st.markdown("""#### Assumptions & limitations
-- Time unit for inventory maths = **week**; lead time entered in days and converted (÷7).
-- Analytical formula assumes i.i.d. demand, lead time independent of demand, Normal LTD → relaxed by Monte Carlo (Gamma, skewed lead times, ρ > 0).
-- Source data has **no stock, supplier lead-time, PO or promotion fields** — these are configured or simulated and labelled so.
-- Policy simulation: continuous review (s, Q), daily periods, lost sales, Gamma demand, integer-day lead times.
-- Refresh is **on-demand batch**, not a real-time stream.
-- LSTM not deployed: ≈105 weekly points per SKU is too short; MLP neural net included and compared fairly.""")
-        st.markdown("""#### References
-- Chen, D. (2019). *Online Retail II*. UCI ML Repository. doi:10.24432/C5CG6D (CC BY 4.0)
-- Silver, Pyke & Thomas (2017). *Inventory and Production Management in Supply Chains*, 4th ed.
-- Hyndman & Athanasopoulos (2021). *Forecasting: Principles and Practice*, 3rd ed.
-- Makridakis, Spiliotis & Assimakopoulos (2022). M5 accuracy competition. *IJF* 38(4).
-- Jones, Schonlau & Welch (1998). Efficient global optimisation of expensive black-box functions. *J. Global Optim.*
-- Akiba et al. (2019). Optuna: a next-generation hyperparameter optimisation framework. *KDD*.""")
+        buf = io.BytesIO()
+        with pd.ExcelWriter(buf, engine="openpyxl") as xw:
+            pd.DataFrame({"Field": ["Student", "ID", "Programme", "Course", "Generated", "Service level", "Lead time (d)", "Lead-time σ (d)", "Demand basis"],
+                          "Value": [STUDENT["name"], STUDENT["id"], f"{STUDENT['prog']} {STUDENT['batch']}", f"{STUDENT['course']} — {STUDENT['lab']}",
+                                    datetime.now().strftime("%Y-%m-%d %H:%M"), svc, ss.lt_days, ss.lt_sd_days, ss.basis]}).to_excel(xw, sheet_name="Cover", index=False)
+            P[COLS].to_excel(xw, sheet_name="Inventory", index=False)
+            rep_fc.to_excel(xw, sheet_name="Forecast accuracy")
+            if cmp_ is not None:
+                cmp_.to_excel(xw, sheet_name="SS comparison", index=False)
+            if ss.get("mc_scenarios") is not None:
+                ss["mc_scenarios"].to_excel(xw, sheet_name="MC scenarios", index=False)
+            if bo:
+                bo["res"]["trials"].to_excel(xw, sheet_name="BO trials", index=False)
+            dq.to_excel(xw, sheet_name="Data quality", index=False)
+        c = st.columns(4)
+        c[0].download_button("⬇ Full report (Excel)", buf.getvalue(), f"AI_Inventory_Report_{STUDENT['id']}.xlsx", type="primary", width="stretch")
+        c[1].download_button("⬇ Inventory CSV", P[COLS].to_csv(index=False).encode(), "inventory.csv", width="stretch")
+        c[2].download_button("⬇ Forecast accuracy CSV", rep_fc.to_csv().encode(), f"forecast_accuracy_{FOCUS}.csv", width="stretch")
+        c[3].download_button("⬇ Data quality CSV", dq.to_csv(index=False).encode(), "data_quality.csv", width="stretch")
+    else:
+        st.markdown(ui.section("Assignment → implementation map", "Session II: AI Applications in Reorder Point & Inventory Management — Exercise"), unsafe_allow_html=True)
+        st.markdown("""<div class='card'><b>Objective (from the brief):</b> enhance the reorder-point calculator and sensitivity analysis by introducing
+        predictive intelligence, adaptive decision-making and real-time optimisation.</div>""", unsafe_allow_html=True)
+        req = pd.DataFrame([
+            ["1. Demand forecasting", "ML models (time series, regression, LSTM)", "Naive, Seasonal Naive, MA, ETS, ARIMA/SARIMA, Gradient Boosting regression, MLP neural net (LSTM assessed — see note)", "Demand Forecasting"],
+            ["1. Demand forecasting", "Historical data, seasonality, promotions, external factors", "2 years of real invoices; STL + Fourier calendar features; price as promo proxy; Q4 peak flag", "Demand Forecasting"],
+            ["1. Demand forecasting", "Possibility of adding new data", "CSV upload with auto/manual column mapping, validation, dedupe, reconciliation; manual entry", "Data Manager"],
+            ["1. Demand forecasting", "Continuously update forecasts", "Content-hashed caches → every ingestion retrains, re-backtests and refreshes all KPIs; timestamped", "All tabs"],
+            ["2. Dynamic safety stock", "Probabilistic model: demand & lead-time variability", "SS = Z√(σ²_D·L + D̄²·σ²_L) with σ_D from live forecast error (dynamic)", "Safety Stock & ROP"],
+            ["2. Dynamic safety stock", "Monte Carlo risk scenarios & buffers", "10k–100k draws, 5 demand × 5 lead-time distributions, copula dependence, 5 stress scenarios", "Monte Carlo Risk"],
+            ["3. AI sensitivity analysis", "Bayesian optimisation of ROP under constraints", "GP-EI (Matern-5/2) and Optuna TPE over (s, Q) with fill-rate, capacity, budget, MOQ constraints; CRN + independent validation", "Bayesian Optimization"],
+            ["AI & automation", "Show what AI adds vs the pre-AI method", "Replay on 26 real weeks: textbook static policy vs self-retraining, bias-correcting, conformal, cost-aware AI policy", "Before vs After AI"],
+            ["AI & automation", "Adaptive decision-making", "Drift detection (tracking signal) → automatic champion/challenger retraining; Isolation Forest anomalies; ABC-XYZ + K-means segment service levels", "AI Autopilot"],
+            ["AI & automation", "Real-time optimisation / automation", "Replenishment agent drafts POs with rationale on every data load; portfolio-wide Bayesian tuning; auto exception digest", "AI Autopilot, Bayesian Optimization"],
+            ["Condition", "No sharing of data with peers", "Local single-user session; uploads held in session memory only; no telemetry; no external AI service", "Sidebar note"],
+        ], columns=["Workstream", "Requirement", "Implementation", "Where"])
+        st.dataframe(req, hide_index=True, width="stretch")
+        c1, c2 = st.columns(2)
+        with c1:
+            st.markdown("#### Key formulas")
+            st.latex(r"Z = \Phi^{-1}(\alpha)\qquad \sigma_{LTD}=\sqrt{\sigma_D^2L+\bar D^2\sigma_L^2}")
+            st.latex(r"SS = Z\,\sigma_{LTD}\qquad ROP=\bar D L + SS\qquad EOQ=\sqrt{2DK/h}")
+            st.latex(r"P(\text{stockout}) = 1-\Phi\!\left(\tfrac{IP-\bar D L}{\sigma_{LTD}}\right)\qquad \beta = 1-\tfrac{\sigma_{LTD}\,G(Z)}{Q}")
+            st.latex(r"\text{WAPE}=\tfrac{\sum|y-\hat y|}{\sum|y|}\qquad \text{EI}(x)=\mathbb{E}[\max(f^{*}-f(x),0)]")
+        with c2:
+            st.markdown("""#### Assumptions & limitations
+    - Time unit for inventory maths = **week**; lead time entered in days and converted (÷7).
+    - Analytical formula assumes i.i.d. demand, lead time independent of demand, Normal LTD → relaxed by Monte Carlo (Gamma, skewed lead times, ρ > 0).
+    - Source data has **no stock, supplier lead-time, PO or promotion fields** — these are configured or simulated and labelled so.
+    - Policy simulation: continuous review (s, Q), daily periods, lost sales, Gamma demand, integer-day lead times.
+    - Refresh is **on-demand batch**, not a real-time stream.
+    - LSTM not deployed: ≈105 weekly points per SKU is too short; MLP neural net included and compared fairly.""")
+            st.markdown("""#### References
+    - Chen, D. (2019). *Online Retail II*. UCI ML Repository. doi:10.24432/C5CG6D (CC BY 4.0)
+    - Silver, Pyke & Thomas (2017). *Inventory and Production Management in Supply Chains*, 4th ed.
+    - Hyndman & Athanasopoulos (2021). *Forecasting: Principles and Practice*, 3rd ed.
+    - Makridakis, Spiliotis & Assimakopoulos (2022). M5 accuracy competition. *IJF* 38(4).
+    - Jones, Schonlau & Welch (1998). Efficient global optimisation of expensive black-box functions. *J. Global Optim.*
+    - Akiba et al. (2019). Optuna: a next-generation hyperparameter optimisation framework. *KDD*.""")
 
 st.markdown(f"""<div class='footer'><span>© 2026 · <b>{STUDENT['course']}</b> — done by <b>{STUDENT['name']}</b> · {STUDENT['id']} · {STUDENT['prog']} {STUDENT['batch']} · {STUDENT['school']}</span>
 <span>Data: UCI Online Retail II (CC BY 4.0) · Individual work — no data shared with peers</span></div>""", unsafe_allow_html=True)

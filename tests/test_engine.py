@@ -120,3 +120,45 @@ def test_common_random_numbers_are_deterministic():
     sim = O.PolicySimulator(500, 100, 1.5, 0.3, reps=40, seed=9)
     cp = O.CostParams()
     assert sim.run(800, 1000, cp)["total_cost"] == sim.run(800, 1000, cp)["total_cost"]
+
+
+# ---------------------------------------------------------------- automation layer
+from inventory_core import automation as A
+
+
+def test_segmentation_assigns_abc_xyz_and_service(real):
+    df, _, _ = real
+    seg = A.segment(df)
+    assert set(seg["ABC"]) <= {"A", "B", "C"} and set(seg["XYZ"]) <= {"X", "Y", "Z"}
+    assert seg["ai_service"].between(0.9, 0.98).all() and seg["cluster"].nunique() == 4
+    a = seg[seg.ABC == "A"].revenue.sum() / seg.revenue.sum()
+    assert 0.7 <= a <= 0.85
+
+
+def test_anomaly_detection_flags_injected_spike(real):
+    df, sku, y = real
+    d2 = df.copy()
+    last = d2[d2.sku == sku].date.max()
+    d2.loc[(d2.sku == sku) & (d2.date > last - pd.Timedelta(days=7)), "demand"] *= 25
+    an = A.detect_anomalies(d2)
+    flagged = an[(an.sku == sku) & an.anomaly]
+    assert (flagged.week >= last - pd.Timedelta(days=14)).any()
+
+
+def test_tracking_signal():
+    assert A.tracking_signal([5, 5, 5, 5]) == pytest.approx(4.0)
+    assert A.tracking_signal([1, -1, 1, -1]) == pytest.approx(0.0)
+
+
+def test_replay_static_vs_dynamic_and_agent(real):
+    df, sku, y = real
+    cp = O.CostParams(unit_cost=1, order_cost=40, shortage_cost=2)
+    daily = np.full(70, 10.0)
+    r = A.replay(daily, np.full(10, 200.0), np.full(10, 300.0), np.full(50, 7), cp)
+    assert r["fill_rate"] == pytest.approx(1.0) and r["orders"] >= 1
+    r0 = A.replay(daily, np.zeros(10), np.full(10, 1.0), np.full(50, 7), cp)
+    assert r0["fill_rate"] < 0.5
+    P = pd.DataFrame({"sku": ["X"], "description": ["x"], "d_bar": [100.0], "sd_d": [30.0], "inv_position": [50.0],
+                      "on_hand": [50.0], "eoq": [300.0], "rop": [260.0], "fc_wape": [30.0], "unit_cost": [1.0], "svc": [0.95], "segment": ["AX"]})
+    R, log = A.agent_decisions(P, 2, 0.5, n_mc=2000)
+    assert R.iloc[0]["action"] == "EXPEDITE" and R.iloc[0]["order_qty"] > 0 and [l["step"] for l in log] == ["Perceive", "Reason", "Decide", "Act"]
