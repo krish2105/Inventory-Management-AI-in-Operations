@@ -22,8 +22,21 @@ ROOT = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(ROOT / "src"))
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
+import importlib  # noqa: E402
 from inventory_core import data as D, forecasting as F, inventory as I, simulation as S, optimization as O, automation as A  # noqa: E402
 import ui  # noqa: E402
+
+# Streamlit re-executes app.py on every rerun but keeps imported modules cached in the server process.
+# After a redeploy (git push) the old ui/engine modules could stay in memory and no longer match app.py,
+# so reload them whenever their source file changed since they were loaded.
+for _m in (D, F, I, S, O, A, ui):
+    try:
+        _mt = Path(_m.__file__).stat().st_mtime
+        if getattr(_m, "_loaded_mtime", None) not in (None, _mt):
+            importlib.reload(_m)
+        _m._loaded_mtime = Path(_m.__file__).stat().st_mtime
+    except Exception:
+        pass
 
 st.set_page_config(page_title="AI Inventory Intelligence | Krishna Mathur", page_icon="📦", layout="wide",
                    initial_sidebar_state="expanded")

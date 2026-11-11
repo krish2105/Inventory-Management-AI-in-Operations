@@ -7,3 +7,5 @@ data/raw/
 *.jpeg
 .pytest_cache/
 outputs/tmp/
+*_Presentation_Script.pdf
+*.zip
