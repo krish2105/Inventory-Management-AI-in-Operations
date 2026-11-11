@@ -1,0 +1,9 @@
+.venv/
+__pycache__/
+*.pyc
+.DS_Store
+.claude/
+data/raw/
+*.jpeg
+.pytest_cache/
+outputs/tmp/
