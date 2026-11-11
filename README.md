@@ -39,7 +39,7 @@ Rebuild data from raw: download the UCI zip into `data/raw/`, then `python scrip
 
 ## Structure
 ```
-apps/streamlit/app.py, ui.py     Streamlit dashboard + theme
+apps/streamlit/app.py, inventory_ui.py  Streamlit dashboard + theme
 src/inventory_core/              Shared engine: data, forecasting, inventory, simulation, optimization, automation (AI layer)
 data/processed/                  Cleaned real dataset used by app & notebook
 submissions/Laboratory Work 1/   Executed notebook, one-page PDF summary, Colab link file

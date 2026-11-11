@@ -24,7 +24,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 import importlib  # noqa: E402
 from inventory_core import data as D, forecasting as F, inventory as I, simulation as S, optimization as O, automation as A  # noqa: E402
-import ui  # noqa: E402
+import inventory_ui as ui  # noqa: E402  (renamed from ui.py so a redeploy can never reuse a stale module)
 
 # Streamlit re-executes app.py on every rerun but keeps imported modules cached in the server process.
 # After a redeploy (git push) the old ui/engine modules could stay in memory and no longer match app.py,
@@ -32,7 +32,7 @@ import ui  # noqa: E402
 for _m in (D, F, I, S, O, A, ui):
     try:
         _mt = Path(_m.__file__).stat().st_mtime
-        if getattr(_m, "_loaded_mtime", None) not in (None, _mt):
+        if getattr(_m, "_loaded_mtime", None) != _mt:   # first sight in this process, or file changed
             importlib.reload(_m)
         _m._loaded_mtime = Path(_m.__file__).stat().st_mtime
     except Exception:
